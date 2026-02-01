@@ -82,6 +82,25 @@ pub struct McpServer {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct DataTable {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub schema: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct DataTableRow {
+    pub id: Uuid,
+    pub table_id: Uuid,
+    pub data: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvVar {
     pub key: String,
@@ -114,4 +133,11 @@ pub struct CredentialInput {
     pub name: String,
     pub provider: String,
     pub data: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DataTableInput {
+    pub name: String,
+    pub description: Option<String>,
+    pub schema: serde_json::Value,
 }
