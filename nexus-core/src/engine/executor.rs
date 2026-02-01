@@ -15,29 +15,30 @@ impl CodeExecutor {
         context.with(|ctx| {
             let globals = ctx.globals();
             
-            // Inject input data safely by parsing a JSON string
-            // We use base64 to avoid any quote/escaping issues in the format! macro
-            let b64_input = general_purpose::STANDARD.encode(input_json);
+            // Inject input data safely
+            // We use JSON.parse on a stringified version to ensure proper object creation in JS
+            let input_json_escaped = input_json.replace("\\", "\\\\").replace("'", "\\'");
             
-            // polyfill atob if not present
             let init_script = format!(
                 r#" 
                 (function() {{ 
-                    const b64 = '{}';
-                    // Simple atob polyfill for QuickJS
-                    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-                    const atob = (input) => {{ 
-                        let str = input.replace(/[=]+$/, '');
-                        let output = '';
-                        for (let bc = 0, bs = 0, buffer, i = 0; buffer = str.charAt(i++); ~buffer && (bc % 4 || (buffer = 0, buffer)) ? output += String.fromCharCode(255 & buffer >> (-2 * bc & 6)) : 0) {{ 
-                            buffer = chars.indexOf(buffer);
-                        }}
-                        return output;
+                    const rawInput = JSON.parse('{}');
+                    const items = Array.isArray(rawInput) ? rawInput : [rawInput];
+                    
+                    // Map to n8n style [{{ json: {{ ... }} }}] if not already
+                    const normalizedItems = items.map(item => {{
+                        if (item && typeof item === 'object' && 'json' in item) return item;
+                        return {{ json: item }};
+                    }});
+
+                    globalThis.$input = {{
+                        all: () => normalizedItems,
+                        first: () => normalizedItems[0],
+                        last: () => normalizedItems[normalizedItems.length - 1]
                     }};
-                    globalThis.$input = JSON.parse(atob(b64));
                 }})();
                 "#,
-                b64_input
+                input_json_escaped
             );
             
             ctx.eval::<(), _>(init_script).map_err(|e| format!("Init Error: {}", e))?;

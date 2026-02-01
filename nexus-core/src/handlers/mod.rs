@@ -1,8 +1,93 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, Form},
     http::StatusCode,
 };
+
+// ... (other imports)
+
+pub async fn handle_slack_interactive(
+    State(state): State<AppState>,
+    Form(payload): Form<serde_json::Value>,
+) -> Result<StatusCode, StatusCode> {
+    // Slack sends payload as a string in a form field
+    let payload_str = payload.get("payload").and_then(|v| v.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
+    let payload_json: serde_json::Value = serde_json::from_str(payload_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+    
+    let ts = payload_json.get("container").and_then(|v| v.get("message_ts")).and_then(|v| v.as_str());
+    let channel = payload_json.get("channel").and_then(|v| v.get("id")).and_then(|v| v.as_str());
+    let action_id = payload_json.get("actions").and_then(|v| v.get(0)).and_then(|v| v.get("action_id")).and_then(|v| v.as_str());
+
+    if let (Some(ts), Some(_ch), Some(action)) = (ts, channel, action_id) {
+        // Find the execution waiting for this message
+        // In a real implementation, we'd search by TS and Channel in the snapshot data
+        let execution = sqlx::query_as::<_, ExecutionRecord>(
+            "SELECT * FROM executions WHERE status = 'waiting' AND snapshot->'wait_info'->>'ts' = $1 LIMIT 1"
+        )
+        .bind(ts)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        if let Some(record) = execution {
+            // Resume Execution
+            let snapshot = record.snapshot.ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            let mut last_output = serde_json::json!({
+                "action": action,
+                "user": payload_json.get("user").and_then(|v| v.get("username")).and_then(|v| v.as_str()),
+                "timestamp": chrono::Utc::now()
+            });
+            
+            let remaining_nodes: Vec<Node> = serde_json::from_value(snapshot.get("remaining_nodes").cloned().unwrap_or_default()).unwrap_or_default();
+            let mut results: Vec<NodeExecutionResult> = serde_json::from_value(record.results).unwrap_or_default();
+            
+            // Continue execution loop
+            let mut success = true;
+            for node in remaining_nodes {
+                let node_start_time = std::time::Instant::now();
+                match execute_single_node(&state.db, &node, &vec![], &vec![], &last_output).await {
+                    Ok(output) => {
+                        last_output = output.clone();
+                        results.push(NodeExecutionResult {
+                            node_id: node.id.to_string(),
+                            node_name: node.label.clone(),
+                            success: true,
+                            output: Some(output),
+                            error: None,
+                            execution_time_ms: node_start_time.elapsed().as_millis() as u64,
+                        });
+                    }
+                    Err(e) => {
+                        success = false;
+                        results.push(NodeExecutionResult {
+                            node_id: node.id.to_string(),
+                            node_name: node.label.clone(),
+                            success: false,
+                            output: None,
+                            error: Some(e),
+                            execution_time_ms: node_start_time.elapsed().as_millis() as u64,
+                        });
+                        break;
+                    }
+                }
+            }
+
+            // Update execution record to finished
+            let _ = sqlx::query(
+                "UPDATE executions SET status = $1, results = $2, end_time = NOW(), snapshot = NULL WHERE id = $3"
+            )
+            .bind(if success { "success" } else { "failed" })
+            .bind(serde_json::to_value(&results).unwrap_or_default())
+            .bind(record.id)
+            .execute(&state.db)
+            .await;
+
+            return Ok(StatusCode::OK);
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
 use uuid::Uuid;
 use crate::state::AppState;
 use crate::models::*;
@@ -142,10 +227,43 @@ pub async fn execute_workflow(
 
     let mut last_output = serde_json::json!({});
 
-    for node in &node_execution_order {
+    for (idx, node) in node_execution_order.iter().enumerate() {
         let node_start_time = std::time::Instant::now();
         match execute_single_node(&state.db, node, &request.nodes, &request.edges, &last_output).await {
             Ok(output) => {
+                // Handle Wait Signal
+                if let Some(true) = output.get("__wait").and_then(|v| v.as_bool()) {
+                    // Save snapshot for resumption
+                    let snapshot = serde_json::json!({
+                        "last_output": last_output,
+                        "remaining_nodes": &node_execution_order[idx + 1..],
+                        "wait_info": output
+                    });
+
+                    let record = ExecutionRecord {
+                        id: execution_id,
+                        workflow_id: request.workflow_id.clone(),
+                        workflow_name: workflow_name.clone(),
+                        start_time,
+                        end_time: None,
+                        status: "waiting".to_string(),
+                        results: serde_json::to_value(&results).unwrap_or(serde_json::json!([])),
+                        snapshot: Some(snapshot),
+                    };
+
+                    let _ = sqlx::query(
+                        "INSERT INTO executions (id, workflow_id, workflow_name, start_time, status, results, snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                    )
+                    .bind(record.id).bind(&record.workflow_id).bind(&record.workflow_name).bind(record.start_time).bind(&record.status).bind(&record.results).bind(snapshot).execute(&state.db).await;
+
+                    return Ok(Json(ExecuteWorkflowResponse { 
+                        success: true, 
+                        execution_id, 
+                        results, 
+                        error: Some("Workflow paused: Waiting for interaction".to_string()) 
+                    }));
+                }
+
                 last_output = output.clone();
                 results.push(NodeExecutionResult {
                     node_id: node.id.to_string(),
@@ -179,6 +297,7 @@ pub async fn execute_workflow(
         end_time: Some(chrono::Utc::now()),
         status: if success { "success".to_string() } else { "failed".to_string() },
         results: serde_json::to_value(&results).unwrap_or(serde_json::json!([])),
+        snapshot: None,
     };
 
     let _ = sqlx::query(

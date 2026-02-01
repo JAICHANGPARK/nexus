@@ -17,3 +17,4 @@ dotenvy = "0.15"
 rquickjs = { version = "0.6", features = ["full", "macro"] }
 base64 = "0.22"
 rmcp = { version = "0.14.0", features = ["client", "transport-streamable-http-client-reqwest"] }
+feed-rs = "2.3.1"

@@ -13,8 +13,20 @@
 		logicNodes,
 		transformNodes,
 		aiNodes,
+		toolNodes,
 		endNode,
 		type NodeKind
+	} from '$lib/flow/nodes/definitions';
+
+	const nodeCategories = [
+		{ name: 'Triggers', nodes: triggerNodes, color: 'bg-red-500', icon: Box },
+		{ name: 'Logic', nodes: logicNodes, color: 'bg-yellow-500', icon: Cpu },
+		{ name: 'Transform', nodes: transformNodes, color: 'bg-purple-500', icon: Wrench },
+		{ name: 'AI', nodes: aiNodes, color: 'bg-blue-500', icon: Cpu },
+		{ name: 'Tools', nodes: toolNodes, color: 'bg-amber-500', icon: Wrench },
+		{ name: 'End', nodes: endNode, color: 'bg-slate-500', icon: Box }
+	];
+ Kind
 	} from '$lib/flow/nodes/definitions';
 
 	const nodeCategories = [

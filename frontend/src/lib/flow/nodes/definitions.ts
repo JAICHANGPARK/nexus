@@ -15,12 +15,15 @@ export type NodeKind =
 	| 'set'
 	| 'filter'
 	| 'wait'
+	| 'rss-feed-read'
+	| 'slack'
 	// AI / LLM
 	| 'ai-agent'
 	| 'llm'
 	| 'openai'
 	| 'openrouter'
 	| 'tool'
+	| 'rss-read-tool'
 	// End
 	| 'trigger-end';
 
@@ -90,6 +93,17 @@ export const triggerNodes: NodeDefinition[] = [
 		detail: 'Starts workflow from chat interface',
 		tone: 'emerald',
 		icon: 'CH',
+		width: 220,
+		minHeight: 80,
+		inputs: [],
+		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'rss-feed-trigger',
+		label: 'RSS Feed Trigger',
+		detail: 'Triggers when an RSS feed is updated',
+		tone: 'emerald',
+		icon: 'RS',
 		width: 220,
 		minHeight: 80,
 		inputs: [],
@@ -203,6 +217,28 @@ export const transformNodes: NodeDefinition[] = [
 		minHeight: 80,
 		inputs: [{ id: 'in', label: '' }],
 		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'rss-feed-read',
+		label: 'RSS Read',
+		detail: 'Read RSS feed',
+		tone: 'cobalt',
+		icon: 'RR',
+		width: 200,
+		minHeight: 80,
+		inputs: [{ id: 'in', label: '' }],
+		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'slack',
+		label: 'Slack',
+		detail: 'Send Slack message',
+		tone: 'cobalt',
+		icon: 'SL',
+		width: 200,
+		minHeight: 80,
+		inputs: [{ id: 'in', label: '' }],
+		outputs: [{ id: 'out', label: '' }]
 	}
 ];
 
@@ -263,13 +299,28 @@ export const aiNodes: NodeDefinition[] = [
 			{ id: 'out', label: '' },
 			{ id: 'error', label: 'error' }
 		]
-	},
+	}
+];
+
+// ========== TOOL NODES ==========
+export const toolNodes: NodeDefinition[] = [
 	{
 		kind: 'tool',
 		label: 'MCP Tool',
 		detail: 'Connect to MCP server tool',
 		tone: 'amber',
 		icon: 'TL',
+		width: 180,
+		minHeight: 60,
+		inputs: [],
+		outputs: [{ id: 'tool', label: '', type: 'tool' }]
+	},
+	{
+		kind: 'rss-read-tool',
+		label: 'RSS Read Tool',
+		detail: 'RSS Feed tool for AI Agents',
+		tone: 'amber',
+		icon: 'RT',
 		width: 180,
 		minHeight: 60,
 		inputs: [],
@@ -298,6 +349,7 @@ export const nodeLibrary: NodeDefinition[] = [
 	...logicNodes,
 	...transformNodes,
 	...aiNodes,
+	...toolNodes,
 	...endNode
 ];
 

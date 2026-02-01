@@ -20,6 +20,7 @@ pub struct ExecutionRecord {
     pub end_time: Option<chrono::DateTime<chrono::Utc>>,
     pub status: String,
     pub results: serde_json::Value,
+    pub snapshot: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

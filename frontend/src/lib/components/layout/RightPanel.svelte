@@ -16,6 +16,10 @@
 	import CodeForm from '../nodes/forms/CodeForm.svelte';
 	import ToolForm from '../nodes/forms/ToolForm.svelte';
 	import WaitForm from '../nodes/forms/WaitForm.svelte';
+	import SlackForm from '../nodes/forms/SlackForm.svelte';
+	import RssReadForm from '../nodes/forms/RssReadForm.svelte';
+	import RssTriggerForm from '../nodes/forms/RssTriggerForm.svelte';
+	import RssReadToolForm from '../nodes/forms/RssReadToolForm.svelte';
 	
 	// Logs and Chat
 	import LogsOverviewPanel from '../execution/logs/LogsOverviewPanel.svelte';
@@ -91,6 +95,14 @@
 							<ToolForm node={nexus.selectedNode} />
 						{:else if nexus.selectedNode.data.kind === 'wait'}
 							<WaitForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'slack'}
+							<SlackForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'rss-feed-read'}
+							<RssReadForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'rss-feed-trigger'}
+							<RssTriggerForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'rss-read-tool'}
+							<RssReadToolForm node={nexus.selectedNode} />
 						{:else}
 							<div class="rounded-lg border bg-muted/20 p-4 space-y-4">
 								<div class="space-y-1">

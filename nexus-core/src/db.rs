@@ -67,12 +67,16 @@ pub async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
             start_time TIMESTAMPTZ NOT NULL,
             end_time TIMESTAMPTZ,
             status TEXT NOT NULL,
-            results JSONB NOT NULL
+            results JSONB NOT NULL,
+            snapshot JSONB
         )
         "#,
     )
     .execute(pool)
     .await?;
+
+    // Migration for existing table
+    let _ = sqlx::query("ALTER TABLE executions ADD COLUMN IF NOT EXISTS snapshot JSONB").execute(pool).await;
 
     Ok(())
 }

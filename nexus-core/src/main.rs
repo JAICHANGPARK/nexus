@@ -65,6 +65,7 @@ async fn main() {
         .route("/api/mcp/servers/:id", delete(delete_mcp_server))
         .route("/api/executions", get(list_executions))
         .route("/api/executions/:id", get(get_execution))
+        .route("/api/webhooks/slack/interactive", post(handle_slack_interactive))
         .layer(cors)
         .with_state(state);
 
