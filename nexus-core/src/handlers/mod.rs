@@ -91,7 +91,7 @@ pub async fn handle_slack_interactive(
 use uuid::Uuid;
 use crate::state::AppState;
 use crate::models::*;
-use crate::engine::{execute_single_node, execute_node_recursive};
+use crate::engine::execute_single_node;
 use crate::clients::openai::OpenAiMessage;
 use crate::clients::openrouter::{OpenRouterMessage, OpenRouterRequest};
 use serde::{Deserialize, Serialize};
@@ -206,38 +206,48 @@ pub async fn execute_workflow(
         .unwrap_or_default()
         .unwrap_or_else(|| "Manual Execution".to_string());
 
-    let mut node_execution_order = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-
+    // Use a queue for BFS-like execution to handle branching
+    let mut execution_queue = std::collections::VecDeque::new();
+    
+    // Initial triggers
     if let Some(trigger_id) = request.trigger_node_id {
         if let Some(trigger) = request.nodes.iter().find(|n| n.id == trigger_id) {
-            execute_node_recursive(trigger, &request.nodes, &request.edges, &mut visited, &mut node_execution_order);
+            execution_queue.push_back((trigger, serde_json::json!({})));
         }
     } else {
         let trigger_nodes: Vec<&Node> = request.nodes.iter()
             .filter(|n| !request.edges.iter().any(|e| e.to == n.id))
             .collect();
-
         for trigger in trigger_nodes {
-            execute_node_recursive(trigger, &request.nodes, &request.edges, &mut visited, &mut node_execution_order);
+            execution_queue.push_back((trigger, serde_json::json!({})));
         }
     }
 
-    node_execution_order.reverse();
-
-    let mut last_output = serde_json::json!({});
-
-    for (idx, node) in node_execution_order.iter().enumerate() {
+    while let Some((node, input_data)) = execution_queue.pop_front() {
         let node_start_time = std::time::Instant::now();
-        match execute_single_node(&state.db, node, &request.nodes, &request.edges, &last_output).await {
+        match execute_single_node(&state.db, node, &request.nodes, &request.edges, &input_data).await {
             Ok(output) => {
-                // Handle Wait Signal
+                // 1. Handle Filtering
+                if let Some(true) = output.get("__filtered").and_then(|v| v.as_bool()) {
+                    results.push(NodeExecutionResult {
+                        node_id: node.id.to_string(),
+                        node_name: node.label.clone(),
+                        success: true,
+                        output: Some(output),
+                        error: None,
+                        execution_time_ms: node_start_time.elapsed().as_millis() as u64,
+                    });
+                    continue; // Stop this branch
+                }
+
+                // 2. Handle Wait Signal
                 if let Some(true) = output.get("__wait").and_then(|v| v.as_bool()) {
-                    // Save snapshot for resumption
+                    // ... (snapshot logic)
                     let snapshot = serde_json::json!({
-                        "last_output": last_output,
-                        "remaining_nodes": &node_execution_order[idx + 1..],
-                        "wait_info": output
+                        "last_output": input_data,
+                        "remaining_queue": execution_queue.iter().map(|(n, i)| (n.id, i)).collect::<Vec<_>>(),
+                        "wait_info": output,
+                        "current_node_id": node.id
                     });
 
                     let record = ExecutionRecord {
@@ -254,27 +264,35 @@ pub async fn execute_workflow(
                     let _ = sqlx::query(
                         "INSERT INTO executions (id, workflow_id, workflow_name, start_time, status, results, snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7)"
                     )
-                    .bind(record.id).bind(&record.workflow_id).bind(&record.workflow_name).bind(record.start_time).bind(&record.status).bind(&record.results).bind(snapshot).execute(&state.db).await;
+                    .bind(record.id).bind(&record.workflow_id).bind(&record.workflow_name).bind(record.start_time).bind(&record.status).bind(&record.results).bind(record.snapshot).execute(&state.db).await;
 
-                    return Ok(Json(ExecuteWorkflowResponse { 
-                        success: true, 
-                        execution_id, 
-                        results, 
-                        error: Some("Workflow paused: Waiting for interaction".to_string()) 
-                    }));
+                    return Ok(Json(ExecuteWorkflowResponse { success: true, execution_id, results, error: Some("Workflow paused".to_string()) }));
                 }
 
-                last_output = output.clone();
                 results.push(NodeExecutionResult {
                     node_id: node.id.to_string(),
                     node_name: node.label.clone(),
                     success: true,
-                    output: Some(output),
+                    output: Some(output.clone()),
                     error: None,
                     execution_time_ms: node_start_time.elapsed().as_millis() as u64,
                 });
+
+                // 3. Determine Next Nodes based on port
+                let port = output.get("__port").and_then(|v| v.as_str());
+                
+                let next_edges: Vec<&Edge> = request.edges.iter()
+                    .filter(|e| e.from == node.id && (port.is_none() || e.from_port == port.map(|s| s.to_string())))
+                    .collect();
+
+                for edge in next_edges {
+                    if let Some(next_node) = request.nodes.iter().find(|n| n.id == edge.to) {
+                        execution_queue.push_back((next_node, output.clone()));
+                    }
+                }
             }
             Err(e) => {
+                // ... error handling
                 success = false;
                 results.push(NodeExecutionResult {
                     node_id: node.id.to_string(),
@@ -377,6 +395,31 @@ pub async fn create_credential(State(state): State<AppState>, Json(input): Json<
 pub async fn delete_credential(Path(id): Path<Uuid>, State(state): State<AppState>) -> StatusCode {
     let result = sqlx::query("DELETE FROM credentials WHERE id = $1").bind(id).execute(&state.db).await;
     match result { Ok(res) if res.rows_affected() > 0 => StatusCode::OK, _ => StatusCode::NOT_FOUND }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PostgresTestRequest {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: Option<String>,
+    pub database: String,
+}
+
+pub async fn test_postgres_connection(
+    Json(req): Json<PostgresTestRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let password = req.password.unwrap_or_default();
+    let connection_url = format!("postgres://{}:{}@{}:{}/{}", req.user, password, req.host, req.port, req.database);
+    
+    match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&connection_url)
+        .await {
+            Ok(_) => Ok(Json(serde_json::json!({ "success": true, "message": "Connection successful" }))),
+            Err(e) => Ok(Json(serde_json::json!({ "success": false, "message": e.to_string() })))
+        }
 }
 
 // MCP Server Handlers
