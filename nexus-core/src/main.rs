@@ -54,6 +54,7 @@ async fn main() {
         .route("/api/mcp/servers/:id/status", get(check_mcp_server_status))
         .route("/api/credentials", get(list_credentials).post(create_credential))
         .route("/api/credentials/:id", delete(delete_credential))
+        .route("/api/credentials/test/postgres", post(test_postgres_connection))
         .route("/api/llm/execute", post(execute_llm))
         .route("/api/openai/execute", post(execute_openai))
         .route("/api/chat/trigger", post(chat_trigger))
