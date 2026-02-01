@@ -24,8 +24,9 @@ export interface ExecutionResult {
 		{ status: 'success' | 'error'; message?: string; count?: number; output?: any }
 	>;
 	summary: { total: number; success: number; errors: number; duration: number } | null;
+	fullResults?: any;
 }
 
 export type ViewMode = 'json' | 'table' | 'schema';
-export type ActiveView = 'canvas' | 'credentials' | 'tools';
+export type ActiveView = 'canvas' | 'credentials' | 'tools' | 'knowledge-base' | 'data-table';
 export type SidebarTab = 'nodes' | 'executions';
