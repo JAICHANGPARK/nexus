@@ -7,6 +7,8 @@
 	import RightPanel from '$lib/components/layout/RightPanel.svelte';
 	import CredentialsView from '$lib/components/credentials/CredentialsView.svelte';
 	import ToolsView from '$lib/components/tools/ToolsView.svelte';
+	import DataTableView from '$lib/components/knowledge/DataTableView.svelte';
+	import KnowledgeBaseView from '$lib/components/knowledge/KnowledgeBaseView.svelte';
 	import '@xyflow/svelte/dist/style.css';
 
 	function onKeyDown(event: KeyboardEvent) {
@@ -68,6 +70,10 @@
 		<CredentialsView />
 	{:else if nexus.activeView === 'tools'}
 		<ToolsView />
+	{:else if nexus.activeView === 'data-table'}
+		<DataTableView />
+	{:else if nexus.activeView === 'knowledge-base'}
+		<KnowledgeBaseView />
 	{/if}
 </div>
 
