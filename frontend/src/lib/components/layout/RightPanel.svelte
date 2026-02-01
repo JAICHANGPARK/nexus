@@ -20,6 +20,14 @@
 	import RssReadForm from '../nodes/forms/RssReadForm.svelte';
 	import RssTriggerForm from '../nodes/forms/RssTriggerForm.svelte';
 	import RssReadToolForm from '../nodes/forms/RssReadToolForm.svelte';
+	import DateTimeForm from '../nodes/forms/DateTimeForm.svelte';
+	import IfForm from '../nodes/forms/IfForm.svelte';
+	import FilterForm from '../nodes/forms/FilterForm.svelte';
+	import SwitchForm from '../nodes/forms/SwitchForm.svelte';
+	import PostgresForm from '../nodes/forms/PostgresForm.svelte';
+	import ConvertToFileForm from '../nodes/forms/ConvertToFileForm.svelte';
+	import ExtractFromFileForm from '../nodes/forms/ExtractFromFileForm.svelte';
+	import ReadWriteFileForm from '../nodes/forms/ReadWriteFileForm.svelte';
 	
 	// Logs and Chat
 	import LogsOverviewPanel from '../execution/logs/LogsOverviewPanel.svelte';
@@ -103,6 +111,22 @@
 							<RssTriggerForm node={nexus.selectedNode} />
 						{:else if nexus.selectedNode.data.kind === 'rss-read-tool'}
 							<RssReadToolForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'dateTime'}
+							<DateTimeForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'if'}
+							<IfForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'filter'}
+							<FilterForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'switch'}
+							<SwitchForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'postgres'}
+							<PostgresForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'convert-to-file'}
+							<ConvertToFileForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'extract-from-file'}
+							<ExtractFromFileForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'read-write-file'}
+							<ReadWriteFileForm node={nexus.selectedNode} />
 						{:else}
 							<div class="rounded-lg border bg-muted/20 p-4 space-y-4">
 								<div class="space-y-1">
