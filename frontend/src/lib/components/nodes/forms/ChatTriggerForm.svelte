@@ -22,6 +22,18 @@
 	}
 
 	let config = $derived((node.data.config as Record<string, any>) || {});
+
+	function handleInput(val: string) {
+		try {
+			const parsed = JSON.parse(val);
+			update('initialInput', parsed);
+		} catch (e) {
+			// If not valid JSON, treat as raw string for fallback (though backend expects object)
+			update('initialInput', { query: val });
+		}
+	}
+
+	let displayValue = $derived(config.initialInput ? (typeof config.initialInput === 'object' ? JSON.stringify(config.initialInput, null, 2) : config.initialInput) : '');
 </script>
 
 <div class="space-y-4">
@@ -44,7 +56,8 @@
 	</div>
 
 	<div class="grid gap-2">
-		<Label for="initial-messages">Initial Messages</Label>
-		<Textarea id="initial-messages" value={config.initialMessages ?? ''} oninput={(e: Event & { currentTarget: HTMLTextAreaElement }) => update('initialMessages', e.currentTarget.value)} placeholder="Enter starting messages..." rows={4} />
+		<Label for="initial-messages">Initial Input (JSON)</Label>
+		<Textarea id="initial-messages" value={displayValue} oninput={(e: Event & { currentTarget: HTMLTextAreaElement }) => handleInput(e.currentTarget.value)} placeholder={'{"query": "Hello", "user": "Nexus"}'} rows={6} class="font-mono text-xs" />
+		<p class="text-[10px] text-muted-foreground italic">Enter a JSON object. This will be passed as $input to the next node.</p>
 	</div>
 </div>
