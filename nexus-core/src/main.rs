@@ -6,7 +6,7 @@ mod clients;
 mod engine;
 
 use axum::{
-    routing::{get, post, delete},
+    routing::{get, post, delete, put},
     Router,
 };
 use std::net::SocketAddr;
@@ -67,6 +67,12 @@ async fn main() {
         .route("/api/executions", get(list_executions))
         .route("/api/executions/:id", get(get_execution))
         .route("/api/webhooks/slack/interactive", post(handle_slack_interactive))
+        .route("/api/webhooks/slack/events", post(handle_slack_events))
+        .route("/api/data-tables", get(list_data_tables).post(create_data_table))
+        .route("/api/data-tables/:id", delete(delete_data_table))
+        .route("/api/data-tables/:id/schema", put(update_data_table_schema))
+        .route("/api/data-tables/:id/rows", get(get_data_table_rows).post(add_data_table_row))
+        .route("/api/data-tables/:table_id/rows/:row_id", put(update_data_table_row).delete(delete_data_table_row))
         .layer(cors)
         .with_state(state);
 
