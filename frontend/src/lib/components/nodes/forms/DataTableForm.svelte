@@ -67,7 +67,7 @@
 	{#if config.operation === 'get' || config.operation === 'update' || config.operation === 'delete'}
 		<div class="grid gap-2">
 			<Label for="rowId">Row ID</Label>
-			<Input id="rowId" type="text" value={config.rowId ?? ''} oninput={(e: Event & { currentTarget: HTMLInputElement }) => update('rowId', e.currentTarget.value)} placeholder="{{ $input.id }}" />
+			<Input id="rowId" type="text" value={config.rowId ?? ''} oninput={(e: Event & { currentTarget: HTMLInputElement }) => update('rowId', e.currentTarget.value)} placeholder={"{{ $input.id }}"} />
 		</div>
 	{/if}
 
