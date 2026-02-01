@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:18-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=nexus
+      - POSTGRES_PASSWORD=nexus
+      - POSTGRES_DB=nexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./nexus-core
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - DATABASE_URL=postgres://nexus:nexus@db:5432/nexus
+    volumes:
+      - ./nexus-core:/app
+      - nexus-core-target:/app/target
+    command: ["cargo", "run"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE=http://localhost:3001
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+      - frontend-svelte-kit:/app/.svelte-kit
+    command:
+      [
+        "sh",
+        "-c",
+        "bun install --frozen-lockfile && bun run dev -- --host 0.0.0.0 --port 5173"
+      ]
+    depends_on:
+      - backend
+
+volumes:
+  frontend-node-modules:
+  frontend-svelte-kit:
+  nexus-core-target:
+  postgres_data:
