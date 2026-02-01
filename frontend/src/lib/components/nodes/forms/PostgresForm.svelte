@@ -82,7 +82,7 @@
 	{#if operation === 'select' || operation === 'delete'}
 		<div class="grid gap-2">
 			<Label for="where">Where Clause (JSON or String)</Label>
-			<Textarea id="where" value={config.where ?? ''} oninput={(e: any) => update('where', e.target.value)} placeholder='id = 1 or {"status": "active"}' rows={3} />
+			<Textarea id="where" value={config.where ?? ''} oninput={(e: any) => update('where', e.target.value)} placeholder={'id = 1 or {"status": "active"}'} rows={3} />
 		</div>
 	{/if}
 
@@ -91,12 +91,12 @@
 			<Label for="columns">Columns to Set (Comma separated)</Label>
 			<Input id="columns" value={config.columns ?? ''} oninput={(e: any) => update('columns', e.target.value)} placeholder="email, name, age" />
 		</div>
-	{if operation === 'update' || operation === 'upsert'}
-		<div class="grid gap-2">
-			<Label for="updateKey">Update Key (Column to match on)</Label>
-			<Input id="updateKey" value={config.updateKey ?? 'id'} oninput={(e: any) => update('updateKey', e.target.value)} />
-		</div>
-	{/if}
+		{#if operation === 'update' || operation === 'upsert'}
+			<div class="grid gap-2">
+				<Label for="updateKey">Update Key (Column to match on)</Label>
+				<Input id="updateKey" value={config.updateKey ?? 'id'} oninput={(e: any) => update('updateKey', e.target.value)} />
+			</div>
+		{/if}
 	{/if}
 
 	{#if operation === 'select'}
