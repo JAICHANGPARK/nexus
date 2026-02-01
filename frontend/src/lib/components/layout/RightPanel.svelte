@@ -1,13 +1,13 @@
 <script lang="ts">
 	import { nexus } from '$lib/nexus.svelte';
-	import { getTableKeys, getSchema } from '$lib/utils';
+	import { getTableKeys, getSchema, downloadFile } from '$lib/utils';
 	import type { NodeKind } from '$lib/flow/nodes/definitions';
 	import * as Tabs from '$lib/components/ui/tabs';
 	import { Separator } from '$lib/components/ui/separator';
 	import * as ScrollArea from '$lib/components/ui/scroll-area';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
-	import { X, Play, Loader2, Info, Box } from 'lucide-svelte';
+	import { X, Play, Loader2, Info, Box, Download } from 'lucide-svelte';
 	import OpenAIForm from '../nodes/forms/OpenAIForm.svelte';
 	import HttpRequestForm from '../nodes/forms/HttpRequestForm.svelte';
 	import OpenRouterForm from '../nodes/forms/OpenRouterForm.svelte';
@@ -28,6 +28,8 @@
 	import ConvertToFileForm from '../nodes/forms/ConvertToFileForm.svelte';
 	import ExtractFromFileForm from '../nodes/forms/ExtractFromFileForm.svelte';
 	import ReadWriteFileForm from '../nodes/forms/ReadWriteFileForm.svelte';
+	import SlackTriggerForm from '../nodes/forms/SlackTriggerForm.svelte';
+	import DataTableForm from '../nodes/forms/DataTableForm.svelte';
 	
 	// Logs and Chat
 	import LogsOverviewPanel from '../execution/logs/LogsOverviewPanel.svelte';
@@ -81,11 +83,12 @@
 		<ScrollArea.Root class="flex-1">
 			<div class="p-4 pb-10">
 				<Tabs.Root value="config" class="w-full">
-					<Tabs.List class="grid w-full grid-cols-2 h-8 mb-6">
-						<Tabs.Trigger value="config" class="text-xs">Parameters</Tabs.Trigger>
-						<Tabs.Trigger value="output" class="text-xs">Output</Tabs.Trigger>
+					<Tabs.List class="grid w-full grid-cols-3 h-9 mb-4">
+						<Tabs.Trigger value="config" class="text-[10px] uppercase font-bold">Config</Tabs.Trigger>
+						<Tabs.Trigger value="input" class="text-[10px] uppercase font-bold">Input</Tabs.Trigger>
+						<Tabs.Trigger value="output" class="text-[10px] uppercase font-bold">Output</Tabs.Trigger>
 					</Tabs.List>
-					
+
 					<Tabs.Content value="config" class="m-0 border-none space-y-6">
 						{#if nexus.selectedNode.data.kind === 'openai'}
 							<OpenAIForm node={nexus.selectedNode} />
@@ -127,6 +130,10 @@
 							<ExtractFromFileForm node={nexus.selectedNode} />
 						{:else if nexus.selectedNode.data.kind === 'read-write-file'}
 							<ReadWriteFileForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'slack-trigger'}
+							<SlackTriggerForm node={nexus.selectedNode} />
+						{:else if nexus.selectedNode.data.kind === 'data-table'}
+							<DataTableForm node={nexus.selectedNode} />
 						{:else}
 							<div class="rounded-lg border bg-muted/20 p-4 space-y-4">
 								<div class="space-y-1">
@@ -142,6 +149,30 @@
 						{/if}
 					</Tabs.Content>
 
+					<Tabs.Content value="input" class="m-0 border-none">
+						{#if nexus.executionResults.nodeResults[nexus.selectedNode.id]}
+							{@const result = nexus.executionResults.nodeResults[nexus.selectedNode.id]}
+							<!-- If we have historical execution data, show the input that was used -->
+							<div class="space-y-4">
+								<div class="px-1">
+									<span class="text-[10px] font-bold uppercase text-muted-foreground tracking-widest">Incoming Data ($input)</span>
+								</div>
+								{#if nexus.executionResults.fullResults}
+									{@const executionIdx = nexus.executionResults.fullResults.results.findIndex(r => r.node_id === nexus.selectedNode.id)}
+									{@const prevNodeOutput = executionIdx > 0 ? nexus.executionResults.fullResults.results[executionIdx - 1].output : {}}
+									<pre class="bg-slate-900 text-slate-300 p-4 rounded-lg text-[10px] overflow-x-auto shadow-inner leading-relaxed border border-slate-800">{JSON.stringify(prevNodeOutput, null, 2)}</pre>
+								{:else}
+									<p class="text-[10px] text-muted-foreground italic px-1">Input data is available after workflow execution.</p>
+								{/if}
+							</div>
+						{:else}
+							<div class="flex flex-col items-center justify-center py-12 text-center text-muted-foreground">
+								<Info class="h-8 w-8 mb-2 opacity-20" />
+								<p class="text-xs">No input data yet.<br/>Run the workflow to see data flow.</p>
+							</div>
+						{/if}
+					</Tabs.Content>
+
 					<Tabs.Content value="output" class="m-0 border-none">
 						{#if nexus.executionResults.nodeResults[nexus.selectedNode.id]}
 							{@const result = nexus.executionResults.nodeResults[nexus.selectedNode.id]}
@@ -153,6 +184,22 @@
 									</Badge>
 								</div>
 								{#if result.output}
+									{#if result.output.data && result.output.format}
+										<div class="p-4 rounded-lg border bg-muted/30 flex items-center justify-between gap-4">
+											<div class="flex items-center gap-3">
+												<div class="h-10 w-10 rounded bg-primary/10 flex items-center justify-center">
+													<Box class="h-5 w-5 text-primary" />
+												</div>
+												<div class="grid gap-0.5">
+													<div class="text-xs font-bold truncate max-w-[120px]">{result.output.fileName || 'file.' + result.output.format}</div>
+													<div class="text-[10px] text-muted-foreground uppercase font-bold">{result.output.format}</div>
+												</div>
+											</div>
+											<Button size="sm" class="h-8 px-3" onclick={() => downloadFile(result.output.data, result.output.fileName, result.output.format)}>
+												<Download class="h-3.5 w-3.5 mr-2" /> Download
+											</Button>
+										</div>
+									{/if}
 									<pre class="bg-slate-950 text-slate-200 p-4 rounded-lg text-[10px] overflow-x-auto shadow-inner leading-relaxed border border-slate-800">{JSON.stringify(result.output, null, 2)}</pre>
 								{:else if result.message}
 									<div class="p-4 rounded-lg bg-destructive/10 border border-destructive/20 text-destructive text-xs">
