@@ -32,6 +32,11 @@ export class NexusState {
 	isCheckingStatus = $state<Record<string, boolean>>({});
 	executions = $state<any[]>([]);
 	selectedExecution = $state<any | null>(null);
+	dataTables = $state<any[]>([]);
+	isFetchingDataTables = $state(false);
+	selectedDataTable = $state<any | null>(null);
+	selectedDataTableRows = $state<any[]>([]);
+	isFetchingDataTableRows = $state(false);
 
 	// Execution State
 	isExecuting = $state(false);
@@ -302,6 +307,7 @@ export class NexusState {
 
 				this.executionResults = {
 					nodeResults,
+					fullResults: result,
 					summary: result.success ? {
 						total: result.results.length,
 						success: result.results.filter((r: any) => r.success).length,
@@ -387,6 +393,131 @@ export class NexusState {
 			this.executions = await response.json();
 		} catch (e) {
 			console.error('Fetch executions failed:', e);
+		}
+	}
+
+	async fetchDataTables() {
+		this.isFetchingDataTables = true;
+		try {
+			const response = await fetch(`${API_BASE}/api/data-tables`);
+			if (response.ok) {
+				this.dataTables = await response.json();
+			}
+		} catch (e) {
+			console.error('Fetch data tables failed:', e);
+		} finally {
+			this.isFetchingDataTables = false;
+		}
+	}
+
+	async createDataTable(name: string, description: string, schema: any) {
+		try {
+			const response = await fetch(`${API_BASE}/api/data-tables`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name, description, schema })
+			});
+			if (response.ok) {
+				await this.fetchDataTables();
+				return await response.json();
+			}
+		} catch (e) {
+			console.error('Create data table failed:', e);
+		}
+		return null;
+	}
+
+	async deleteDataTable(id: string) {
+		try {
+			const response = await fetch(`${API_BASE}/api/data-tables/${id}`, { method: 'DELETE' });
+			if (response.ok) {
+				await this.fetchDataTables();
+				if (this.selectedDataTable?.id === id) {
+					this.selectedDataTable = null;
+					this.selectedDataTableRows = [];
+				}
+			}
+		} catch (e) {
+			console.error('Delete data table failed:', e);
+		}
+	}
+
+	async fetchDataTableRows(tableId: string) {
+		this.isFetchingDataTableRows = true;
+		try {
+			const response = await fetch(`${API_BASE}/api/data-tables/${tableId}/rows`);
+			if (response.ok) {
+				this.selectedDataTableRows = await response.json();
+			}
+		} catch (e) {
+			console.error('Fetch data table rows failed:', e);
+		} finally {
+			this.isFetchingDataTableRows = false;
+		}
+	}
+
+	async addDataTableRow(tableId: string, data: any) {
+		try {
+			const response = await fetch(`${API_BASE}/api/data-tables/${tableId}/rows`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(data)
+			});
+			if (response.ok) {
+				await this.fetchDataTableRows(tableId);
+				return await response.json();
+			}
+		} catch (e) {
+			console.error('Add row failed:', e);
+		}
+		return null;
+	}
+
+	async updateDataTableRow(tableId: string, rowId: string, data: any) {
+		// Note: we need a backend route for this, I'll add it if missing
+		try {
+			const response = await fetch(`${API_BASE}/api/data-tables/${tableId}/rows/${rowId}`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(data)
+			});
+			if (response.ok) {
+				await this.fetchDataTableRows(tableId);
+			}
+		} catch (e) {
+			console.error('Update row failed:', e);
+		}
+	}
+
+	async deleteDataTableRow(tableId: string, rowId: string) {
+		try {
+			const response = await fetch(`${API_BASE}/api/data-tables/${tableId}/rows/${rowId}`, {
+				method: 'DELETE'
+			});
+			if (response.ok) {
+				await this.fetchDataTableRows(tableId);
+			}
+		} catch (e) {
+			console.error('Delete row failed:', e);
+		}
+	}
+
+	async updateDataTableSchema(id: string, schema: any) {
+		try {
+			const response = await fetch(`${API_BASE}/api/data-tables/${id}/schema`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(schema)
+			});
+			if (response.ok) {
+				await this.fetchDataTables();
+				if (this.selectedDataTable?.id === id) {
+					const updated = await response.json();
+					this.selectedDataTable = updated;
+				}
+			}
+		} catch (e) {
+			console.error('Update schema failed:', e);
 		}
 	}
 
