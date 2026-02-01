@@ -7,32 +7,7 @@ use crate::clients::openrouter::{OpenRouterMessage, OpenRouterRequest};
 use crate::engine::executor::CodeExecutor;
 use sqlx::{Pool, Postgres};
 use uuid::Uuid;
-use std::collections::HashSet;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-
-pub fn execute_node_recursive(
-    node: &Node,
-    all_nodes: &[Node],
-    edges: &[Edge],
-    visited: &mut HashSet<Uuid>,
-    execution_order: &mut Vec<Node>,
-) {
-    if visited.contains(&node.id) {
-        return;
-    }
-
-    visited.insert(node.id);
-
-    let child_edges: Vec<&Edge> = edges.iter().filter(|e| e.from == node.id).collect();
-
-    for edge in child_edges {
-        if let Some(child_node) = all_nodes.iter().find(|n| n.id == edge.to) {
-            execute_node_recursive(child_node, all_nodes, edges, visited, execution_order);
-        }
-    }
-
-    execution_order.push(node.clone());
-}
 
 fn interpolate_value(value: &str, input: &serde_json::Value) -> String {
     let mut result = value.to_string();
@@ -52,6 +27,76 @@ fn interpolate_value(value: &str, input: &serde_json::Value) -> String {
         result = result.replace("{{ $input }}", &input.to_string());
     }
     result
+}
+
+lazy_static::lazy_static! {
+    static ref EMPTY_OBJECT: serde_json::Value = serde_json::json!({});
+}
+
+fn evaluate_conditions(conditions: &serde_json::Value, input: &serde_json::Value, ignore_case: bool) -> bool {
+    let Some(cond_list) = conditions.get("conditions").and_then(|v| v.as_array()) else { return true; };
+    let combinator = conditions.get("combinator").and_then(|v| v.as_str()).unwrap_or("and");
+
+    let mut results = Vec::new();
+    for cond in cond_list {
+        let left_raw = cond.get("leftValue").and_then(|v| v.as_str()).unwrap_or("");
+        let left = interpolate_value(left_raw, input);
+        
+        let op_obj = cond.get("operator");
+        let op_type = op_obj.and_then(|v| v.get("type")).and_then(|v| v.as_str()).unwrap_or("string");
+        let op_name = op_obj.and_then(|v| v.get("operation")).and_then(|v| v.as_str()).unwrap_or("equals");
+        
+        let right_raw = cond.get("rightValue").and_then(|v| v.as_str()).unwrap_or("");
+        let right = interpolate_value(right_raw, input);
+
+        let pass = match op_type {
+            "string" => {
+                let (l, r): (String, String) = if ignore_case { (left.to_lowercase(), right.to_lowercase()) } else { (left, right) };
+                match op_name {
+                    "equals" => l == r,
+                    "notEquals" => l != r,
+                    "contains" => l.contains(&r),
+                    "notContains" => !l.contains(&r),
+                    "startsWith" => l.starts_with(&r),
+                    "endsWith" => l.ends_with(&r),
+                    "isEmpty" => l.is_empty(),
+                    "isNotEmpty" => !l.is_empty(),
+                    _ => false
+                }
+            },
+            "number" => {
+                let l = left.parse::<f64>().unwrap_or(0.0);
+                let r = right.parse::<f64>().unwrap_or(0.0);
+                match op_name {
+                    "equals" | "eq" => l == r,
+                    "notEquals" | "ne" => l != r,
+                    "gt" | "larger" => l > r,
+                    "gte" | "largerEqual" => l >= r,
+                    "lt" | "smaller" => l < r,
+                    "lte" | "smallerEqual" => l <= r,
+                    _ => false
+                }
+            },
+            "boolean" => {
+                let l = left.parse::<bool>().unwrap_or(false);
+                let r = right.parse::<bool>().unwrap_or(false);
+                match op_name {
+                    "true" => l == true,
+                    "false" => l == false,
+                    "equals" => l == r,
+                    _ => false
+                }
+            },
+            _ => false
+        };
+        results.push(pass);
+    }
+
+    if combinator == "or" {
+        results.iter().any(|&r| r)
+    } else {
+        results.iter().all(|&r| r)
+    }
 }
 
 pub async fn execute_single_node(
@@ -187,6 +232,294 @@ pub async fn execute_single_node(
             tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
             Ok(serde_json::json!({ "waited": seconds, "unit": "seconds" }))
         }
+        "if" => {
+            let conditions = node.config.get("conditions").unwrap_or(&*EMPTY_OBJECT);
+            let ignore_case = node.config.get("options").and_then(|v| v.get("ignoreCase")).and_then(|v| v.as_bool()).unwrap_or(true);
+            let pass = evaluate_conditions(conditions, input, ignore_case);
+            
+            let mut output = input.clone();
+            if let Some(obj) = output.as_object_mut() {
+                obj.insert("__port".to_string(), serde_json::json!(if pass { "true" } else { "false" }));
+            }
+            Ok(output)
+        },
+        "filter" => {
+            let conditions = node.config.get("conditions").unwrap_or(&*EMPTY_OBJECT);
+            let ignore_case = node.config.get("options").and_then(|v| v.get("ignoreCase")).and_then(|v| v.as_bool()).unwrap_or(true);
+            let pass = evaluate_conditions(conditions, input, ignore_case);
+            
+            if pass { Ok(input.clone()) } else { Ok(serde_json::json!({ "__filtered": true })) }
+        },
+        "switch" => {
+            let mode = node.config.get("mode").and_then(|v| v.as_str()).unwrap_or("rules");
+            if mode == "rules" {
+                let rules = node.config.get("rules").and_then(|v| v.get("values")).and_then(|v| v.as_array());
+                let ignore_case = node.config.get("options").and_then(|v| v.get("ignoreCase")).and_then(|v| v.as_bool()).unwrap_or(true);
+                
+                let mut matched_index = None;
+                if let Some(rules) = rules {
+                    for (i, rule) in rules.iter().enumerate() {
+                        let cond = rule.get("conditions").unwrap_or(&*EMPTY_OBJECT);
+                        if evaluate_conditions(cond, input, ignore_case) {
+                            matched_index = Some(i);
+                            break;
+                        }
+                    }
+                }
+                
+                let port = if let Some(idx) = matched_index { idx.to_string() } else { "fallback".to_string() };
+                let mut output = input.clone();
+                if let Some(obj) = output.as_object_mut() {
+                    obj.insert("__port".to_string(), serde_json::json!(port));
+                }
+                Ok(output)
+            } else {
+                // Expression mode (simplified)
+                let port = node.config.get("output").and_then(|v| v.as_i64()).unwrap_or(0);
+                let mut output = input.clone();
+                if let Some(obj) = output.as_object_mut() {
+                    obj.insert("__port".to_string(), serde_json::json!(port.to_string()));
+                }
+                Ok(output)
+            }
+        },
+        "postgres" => {
+            let operation = node.config.get("operation").and_then(|v| v.as_str()).unwrap_or("select");
+            let cred_id = node.config.get("credentialId").and_then(|v| v.as_str()).ok_or("Credential not specified")?;
+            
+            // 1. Fetch Credentials
+            let cred = sqlx::query_as::<_, Credential>("SELECT * FROM credentials WHERE id = $1")
+                .bind(Uuid::parse_str(cred_id).map_err(|e| e.to_string())?)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("Credential not found")?;
+
+            // 2. Build Connection Pool for External DB
+            let host = cred.data.get("host").and_then(|v| v.as_str()).unwrap_or("localhost");
+            let port = cred.data.get("port").and_then(|v| v.as_u64()).or_else(|| cred.data.get("port").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok())).unwrap_or(5432);
+            let user = cred.data.get("user").and_then(|v| v.as_str()).unwrap_or("postgres");
+            let password = cred.data.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let database = cred.data.get("database").and_then(|v| v.as_str()).unwrap_or("postgres");
+            
+            let connection_url = format!("postgres://{}:{}@{}:{}/{}", user, password, host, port, database);
+            let ext_pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&connection_url)
+                .await
+                .map_err(|e| format!("Failed to connect to external Postgres: {}", e))?;
+
+            // 3. Execute Operation
+            let result = match operation {
+                "executeQuery" => {
+                    let query_raw = node.config.get("query").and_then(|v| v.as_str()).ok_or("Query not specified")?;
+                    let query = interpolate_value(query_raw, input);
+                    
+                    let rows = sqlx::query(&query)
+                        .fetch_all(&ext_pool)
+                        .await
+                        .map_err(|e: sqlx::Error| e.to_string())?;
+                    
+                    let mut results = Vec::new();
+                    for row in rows {
+                        use sqlx::Column;
+                        use sqlx::Row;
+                        let mut map = serde_json::Map::new();
+                        for col in row.columns() {
+                            let name = col.name();
+                            let val: serde_json::Value = if let Ok(v) = row.try_get::<String, _>(name) { serde_json::json!(v) }
+                            else if let Ok(v) = row.try_get::<i64, _>(name) { serde_json::json!(v) }
+                            else if let Ok(v) = row.try_get::<f64, _>(name) { serde_json::json!(v) }
+                            else if let Ok(v) = row.try_get::<bool, _>(name) { serde_json::json!(v) }
+                            else { serde_json::json!(null) };
+                            map.insert(name.to_string(), val);
+                        }
+                        results.push(serde_json::Value::Object(map));
+                    }
+                    serde_json::Value::Array(results)
+                },
+                "select" => {
+                    let schema = node.config.get("schema").and_then(|v| v.as_str()).unwrap_or("public");
+                    let table = node.config.get("table").and_then(|v| v.as_str()).ok_or("Table not specified")?;
+                    let where_clause = node.config.get("where").and_then(|v| v.as_str()).unwrap_or("");
+                    let limit = node.config.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+                    let sort = node.config.get("sort").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let mut query = format!("SELECT * FROM {}.{}", schema, table);
+                    if !where_clause.is_empty() {
+                        query = format!("{} WHERE {}", query, where_clause);
+                    }
+                    if !sort.is_empty() {
+                        query = format!("{} ORDER BY {}", query, sort);
+                    }
+                    query = format!("{} LIMIT {}", query, limit);
+
+                    let rows = sqlx::query(&query).fetch_all(&ext_pool).await.map_err(|e: sqlx::Error| e.to_string())?;
+                    let mut results = Vec::new();
+                    for row in rows {
+                        use sqlx::Column;
+                        use sqlx::Row;
+                        let mut map = serde_json::Map::new();
+                        for col in row.columns() {
+                            let name = col.name();
+                            let val: serde_json::Value = if let Ok(v) = row.try_get::<String, _>(name) { serde_json::json!(v) }
+                            else if let Ok(v) = row.try_get::<i64, _>(name) { serde_json::json!(v) }
+                            else if let Ok(v) = row.try_get::<f64, _>(name) { serde_json::json!(v) }
+                            else if let Ok(v) = row.try_get::<bool, _>(name) { serde_json::json!(v) }
+                            else { serde_json::json!(null) };
+                            map.insert(name.to_string(), val);
+                        }
+                        results.push(serde_json::Value::Object(map));
+                    }
+                    serde_json::Value::Array(results)
+                },
+                "insert" => {
+                    let schema = node.config.get("schema").and_then(|v| v.as_str()).unwrap_or("public");
+                    let table = node.config.get("table").and_then(|v| v.as_str()).ok_or("Table not specified")?;
+                    let columns_str = node.config.get("columns").and_then(|v| v.as_str()).ok_or("Columns not specified")?;
+                    let columns: Vec<&str> = columns_str.split(',').map(|s| s.trim()).collect();
+                    
+                    let mut col_names = Vec::new();
+                    let mut placeholders = Vec::new();
+                    let mut values = Vec::new();
+                    
+                    for (i, &col) in columns.iter().enumerate() {
+                        col_names.push(col);
+                        placeholders.push(format!("${}", i + 1));
+                        let val = input.get(col).cloned().unwrap_or(serde_json::json!(null));
+                        values.push(val);
+                    }
+                    
+                    let query = format!("INSERT INTO {}.{} ({}) VALUES ({}) RETURNING *", schema, table, col_names.join(", "), placeholders.join(", "));
+                    
+                    let mut q = sqlx::query(&query);
+                    for val in values {
+                        if let Some(s) = val.as_str() { q = q.bind(s.to_string()); }
+                        else if let Some(n) = val.as_i64() { q = q.bind(n); }
+                        else if let Some(f) = val.as_f64() { q = q.bind(f); }
+                        else if let Some(b) = val.as_bool() { q = q.bind(b); }
+                        else { q = q.bind(None::<String>); }
+                    }
+                    
+                    let row = q.fetch_one(&ext_pool).await.map_err(|e: sqlx::Error| e.to_string())?;
+                    use sqlx::Column;
+                    use sqlx::Row;
+                    let mut map = serde_json::Map::new();
+                    for col in row.columns() {
+                        let name = col.name();
+                        let val: serde_json::Value = if let Ok(v) = row.try_get::<String, _>(name) { serde_json::json!(v) }
+                        else if let Ok(v) = row.try_get::<i64, _>(name) { serde_json::json!(v) }
+                        else { serde_json::json!(null) };
+                        map.insert(name.to_string(), val);
+                    }
+                    serde_json::Value::Object(map)
+                },
+                _ => serde_json::json!({ "status": "unsupported operation" })
+            };
+
+            Ok(result)
+        },
+        "convert-to-file" => {
+            let operation = node.config.get("operation").and_then(|v| v.as_str()).unwrap_or("csv");
+            let _binary_property = node.config.get("binaryPropertyName").and_then(|v| v.as_str()).unwrap_or("data");
+            
+            match operation {
+                "csv" => {
+                    let mut wtr = csv::Writer::from_writer(vec![]);
+                    if let Some(arr) = input.as_array() {
+                        for item in arr {
+                            if let Some(obj) = item.as_object() {
+                                wtr.serialize(obj).map_err(|e| e.to_string())?;
+                            }
+                        }
+                    } else if let Some(obj) = input.as_object() {
+                        wtr.serialize(obj).map_err(|e| e.to_string())?;
+                    }
+                    let data = String::from_utf8(wtr.into_inner().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({ "data": data, "format": "csv" }))
+                },
+                "toJson" => {
+                    let data = serde_json::to_string_pretty(input).map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({ "data": data, "format": "json" }))
+                },
+                "toText" => {
+                    let source = node.config.get("sourceProperty").and_then(|v| v.as_str()).unwrap_or("data");
+                    let data = input.get(source).and_then(|v| v.as_str()).unwrap_or("");
+                    Ok(serde_json::json!({ "data": data, "format": "text" }))
+                },
+                "toBinary" => {
+                    let source = node.config.get("sourceProperty").and_then(|v| v.as_str()).unwrap_or("data");
+                    let b64 = input.get(source).and_then(|v| v.as_str()).unwrap_or("");
+                    Ok(serde_json::json!({ "data": b64, "format": "base64" }))
+                },
+                _ => Err(format!("Unsupported convert operation: {}", operation))
+            }
+        },
+        "extract-from-file" => {
+            let operation = node.config.get("operation").and_then(|v| v.as_str()).unwrap_or("csv");
+            let source_field = node.config.get("binaryPropertyName").and_then(|v| v.as_str()).unwrap_or("data");
+            let content = input.get(source_field).and_then(|v| v.as_str()).ok_or("Source data not found")?;
+
+            match operation {
+                "csv" => {
+                    let mut rdr = csv::Reader::from_reader(content.as_bytes());
+                    let mut results = Vec::new();
+                    for result in rdr.deserialize() {
+                        let record: serde_json::Value = result.map_err(|e| e.to_string())?;
+                        results.push(record);
+                    }
+                    Ok(serde_json::Value::Array(results))
+                },
+                "fromJson" => {
+                    let val: serde_json::Value = serde_json::from_str(content).map_err(|e| e.to_string())?;
+                    Ok(val)
+                },
+                "text" | "binaryToPropery" => {
+                    Ok(serde_json::json!({ "data": content }))
+                },
+                _ => Err(format!("Unsupported extract operation: {}", operation))
+            }
+        },
+        "read-write-file" => {
+            let operation = node.config.get("operation").and_then(|v| v.as_str()).unwrap_or("read");
+            
+            match operation {
+                "read" => {
+                    let pattern = node.config.get("fileSelector").and_then(|v| v.as_str()).ok_or("File selector not specified")?;
+                    let mut results = Vec::new();
+                    for entry in glob::glob(pattern).map_err(|e| e.to_string())? {
+                        match entry {
+                            Ok(path) => {
+                                let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                                results.push(serde_json::json!({
+                                    "path": path.to_string_lossy(),
+                                    "data": content
+                                }));
+                            },
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                    Ok(serde_json::Value::Array(results))
+                },
+                "write" => {
+                    let file_path = node.config.get("fileName").and_then(|v| v.as_str()).ok_or("File name not specified")?;
+                    let source_field = node.config.get("dataPropertyName").and_then(|v| v.as_str()).unwrap_or("data");
+                    let content = input.get(source_field).and_then(|v| v.as_str()).ok_or("Data to write not found")?;
+                    
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .append(node.config.get("append").and_then(|v| v.as_bool()).unwrap_or(false))
+                        .open(file_path).map_err(|e| e.to_string())?;
+                    
+                    file.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({ "success": true, "path": file_path }))
+                },
+                _ => Err(format!("Unsupported file operation: {}", operation))
+            }
+        },
+
         "trigger-start" | "trigger-schedule" | "trigger-webhook" => Ok(serde_json::json!({ "triggered": true })),
         "rss-feed-read" => {
             let url_raw = node.config.get("url").and_then(|v| v.as_str()).ok_or("URL not specified")?;
@@ -377,6 +710,86 @@ pub async fn execute_single_node(
                     _ => Err(format!("Unsupported Slack operation: {}", operation))
                 },
                 _ => Err(format!("Unsupported Slack resource: {}", resource))
+            }
+        }
+        "dateTime" => {
+            let action = node.config.get("action").and_then(|v| v.as_str()).or_else(|| node.config.get("operation").and_then(|v| v.as_str())).unwrap_or("format");
+            let value_raw = node.config.get("value").and_then(|v| v.as_str()).or_else(|| node.config.get("date").and_then(|v| v.as_str())).ok_or("Value not specified")?;
+            let value = interpolate_value(value_raw, input);
+            
+            // Basic parsing using chrono
+            let dt = if let Ok(d) = chrono::DateTime::parse_from_rfc3339(&value) {
+                d.with_timezone(&chrono::Utc)
+            } else if let Ok(d) = chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S") {
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(d, chrono::Utc)
+            } else if let Ok(d) = chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d") {
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(d.and_hms_opt(0, 0, 0).unwrap(), chrono::Utc)
+            } else if let Ok(ts) = value.parse::<i64>() {
+                if value.len() > 11 { // ms
+                    chrono::DateTime::from_timestamp_millis(ts).unwrap_or_default()
+                } else { // sec
+                    chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()
+                }
+            } else {
+                return Err(format!("Failed to parse date: {}", value));
+            };
+
+            match action {
+                "format" | "formatDate" => {
+                    let format = node.config.get("toFormat").and_then(|v| v.as_str()).or_else(|| node.config.get("format").and_then(|v| v.as_str())).unwrap_or("%Y-%m-%d %H:%M:%S");
+                    let output_field = node.config.get("dataPropertyName").and_then(|v| v.as_str()).or_else(|| node.config.get("outputFieldName").and_then(|v| v.as_str())).unwrap_or("data");
+                    
+                    // Map common n8n formats to chrono formats
+                    let rust_format = match format {
+                        "YYYY-MM-DD" => "%Y-%m-%d",
+                        "MM/DD/YYYY" => "%m/%d/%Y",
+                        "YYYY/MM/DD" => "%Y/%m/%d",
+                        _ => format
+                    };
+                    
+                    Ok(serde_json::json!({ output_field: dt.format(rust_format).to_string() }))
+                },
+                "calculate" | "addToDate" | "subtractFromDate" => {
+                    let operation = node.config.get("operation").and_then(|v| v.as_str()).unwrap_or("add");
+                    let duration = node.config.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let unit = node.config.get("timeUnit").and_then(|v| v.as_str()).unwrap_or("days");
+                    let output_field = node.config.get("dataPropertyName").and_then(|v| v.as_str()).or_else(|| node.config.get("outputFieldName").and_then(|v| v.as_str())).unwrap_or("data");
+
+                    let signed_duration = if operation == "subtract" || action == "subtractFromDate" { -duration } else { duration };
+                    
+                    let new_dt = match unit {
+                        "seconds" => dt + chrono::Duration::seconds(signed_duration),
+                        "minutes" => dt + chrono::Duration::minutes(signed_duration),
+                        "hours" => dt + chrono::Duration::hours(signed_duration),
+                        "days" => dt + chrono::Duration::days(signed_duration),
+                        "weeks" => dt + chrono::Duration::weeks(signed_duration),
+                        "months" => dt + chrono::Duration::days(signed_duration * 30), // Approx
+                        "years" => dt + chrono::Duration::days(signed_duration * 365), // Approx
+                        _ => dt + chrono::Duration::days(signed_duration),
+                    };
+                    
+                    Ok(serde_json::json!({ output_field: new_dt.to_rfc3339() }))
+                },
+                "extractDate" => {
+                    let part = node.config.get("part").and_then(|v| v.as_str()).unwrap_or("month");
+                    let output_field = node.config.get("outputFieldName").and_then(|v| v.as_str()).unwrap_or("datePart");
+                    
+                    use chrono::Datelike;
+                    use chrono::Timelike;
+                    
+                    let val = match part {
+                        "year" => dt.year() as i64,
+                        "month" => dt.month() as i64,
+                        "day" => dt.day() as i64,
+                        "hour" => dt.hour() as i64,
+                        "minute" => dt.minute() as i64,
+                        "second" => dt.second() as i64,
+                        _ => 0
+                    };
+                    
+                    Ok(serde_json::json!({ output_field: val }))
+                }
+                _ => Err(format!("Unsupported action: {}", action))
             }
         }
         "chat-trigger" => Ok(node.config.get("initialInput").cloned().unwrap_or(serde_json::json!({ "triggered": true }))),
