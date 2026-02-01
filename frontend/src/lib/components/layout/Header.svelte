@@ -66,17 +66,26 @@
 		
 		<Separator orientation="vertical" class="h-6" />
 		
-		<Tabs.Root value={nexus.activeView} onValueChange={(v) => { 
-			nexus.activeView = v as any; 
-			if (v === 'credentials') nexus.fetchCredentials();
-			if (v === 'tools') nexus.fetchMcpServers();
-		}}>
-			<Tabs.List class="h-8">
-				<Tabs.Trigger value="canvas" class="text-xs">Studio</Tabs.Trigger>
-				<Tabs.Trigger value="credentials" class="text-xs">Credentials</Tabs.Trigger>
-				<Tabs.Trigger value="tools" class="text-xs">Tools</Tabs.Trigger>
-			</Tabs.List>
-		</Tabs.Root>
+		<div class="flex items-center bg-muted/20 rounded-md p-1">
+			<Button variant={nexus.activeView === 'canvas' ? 'secondary' : 'ghost'} size="sm" class="h-7 text-xs px-3" onclick={() => nexus.activeView = 'canvas'}>Studio</Button>
+			<Button variant={nexus.activeView === 'credentials' ? 'secondary' : 'ghost'} size="sm" class="h-7 text-xs px-3" onclick={() => { nexus.activeView = 'credentials'; nexus.fetchCredentials(); }}>Credentials</Button>
+			
+			<DropdownMenu.Root>
+				<DropdownMenu.Trigger>
+					{#snippet child({ props })}
+						<Button {...props} variant={['data-table', 'knowledge-base'].includes(nexus.activeView) ? 'secondary' : 'ghost'} size="sm" class="h-7 text-xs px-3 gap-1">
+							지식 <ChevronDown class="h-3 w-3 opacity-50" />
+						</Button>
+					{/snippet}
+				</DropdownMenu.Trigger>
+				<DropdownMenu.Content align="start">
+					<DropdownMenu.Item onclick={() => { nexus.activeView = 'data-table'; nexus.fetchDataTables(); }}>Data Table</DropdownMenu.Item>
+					<DropdownMenu.Item onclick={() => nexus.activeView = 'knowledge-base'}>Knowledge Base</DropdownMenu.Item>
+				</DropdownMenu.Content>
+			</DropdownMenu.Root>
+
+			<Button variant={nexus.activeView === 'tools' ? 'secondary' : 'ghost'} size="sm" class="h-7 text-xs px-3" onclick={() => { nexus.activeView = 'tools'; nexus.fetchMcpServers(); }}>Tools</Button>
+		</div>
 
 		{#if nexus.activeView === 'canvas'}
 			<Separator orientation="vertical" class="h-6" />
