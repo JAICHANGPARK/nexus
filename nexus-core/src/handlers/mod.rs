@@ -2,25 +2,148 @@ use axum::{
     Json,
     extract::{Path, State, Form},
     http::StatusCode,
+    response::{IntoResponse, Response},
 };
+use uuid::Uuid;
+use crate::state::AppState;
+use crate::models::*;
+use crate::engine::execute_single_node;
+use crate::clients::openai::OpenAiMessage;
+use crate::clients::openrouter::{OpenRouterMessage, OpenRouterRequest};
+use serde::{Deserialize, Serialize};
 
-// ... (other imports)
+pub async fn handle_slack_events(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    // 1. Handle URL Verification Challenge
+    if let Some(challenge) = payload.get("challenge") {
+        let challenge_str = challenge.as_str().unwrap_or("").to_string();
+        return (StatusCode::OK, Json(serde_json::json!({ "challenge": challenge_str }))).into_response();
+    }
+
+    // 2. Identify Event Type
+    let event_type = payload.get("event").and_then(|e| e.get("type")).and_then(|v| v.as_str()).unwrap_or("");
+    if event_type.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+
+    // 3. Find Workflows with slack-trigger for this event
+    let workflows = match sqlx::query_as::<_, Workflow>("SELECT * FROM workflows")
+        .fetch_all(&state.db)
+        .await {
+            Ok(w) => w,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+
+    for workflow in workflows {
+        let nodes_list: Vec<Node> = serde_json::from_value(workflow.nodes.clone()).unwrap_or_default();
+        let edges_list: Vec<Edge> = serde_json::from_value(workflow.edges.clone()).unwrap_or_default();
+
+        let trigger_node = nodes_list.iter().find(|n| {
+            n.kind == "slack-trigger" && 
+            n.config.get("trigger").and_then(|v| v.as_str()) == Some(event_type)
+        });
+
+        if let Some(node) = trigger_node {
+            // Optional: check channel filter
+            let watch_workspace = node.config.get("watchWorkspace").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !watch_workspace {
+                let config_channel = node.config.get("channelId").and_then(|v| v.as_str()).unwrap_or("");
+                let event_channel = payload.get("event").and_then(|e| e.get("channel")).and_then(|v| v.as_str()).unwrap_or("");
+                if !config_channel.is_empty() && config_channel != event_channel {
+                    continue;
+                }
+            }
+
+            // Start Workflow Execution
+            let db = state.db.clone();
+            let workflow_id = workflow.id;
+            let workflow_name = workflow.name.clone();
+            let event_data = payload.get("event").cloned().unwrap_or(serde_json::json!({}));
+            let all_nodes = nodes_list.clone();
+            let all_edges = edges_list.clone();
+            let start_node = node.clone();
+            
+            tokio::spawn(async move {
+                let execution_id = Uuid::new_v4();
+                let start_time = chrono::Utc::now();
+                let _ = sqlx::query("INSERT INTO executions (id, workflow_id, workflow_name, status, results, start_time) VALUES ($1, $2, $3, $4, $5, $6)")
+                    .bind(execution_id)
+                    .bind(workflow_id)
+                    .bind(workflow_name)
+                    .bind("running")
+                    .bind(serde_json::json!([]))
+                    .bind(start_time)
+                    .execute(&db)
+                    .await;
+
+                let mut results = Vec::new();
+                let mut queue = std::collections::VecDeque::new();
+                queue.push_back((start_node, event_data));
+
+                while let Some((current_node, current_input)) = queue.pop_front() {
+                    let node_start_time = std::time::Instant::now();
+                    let result = execute_single_node(&db, &current_node, &all_nodes, &all_edges, &current_input).await;
+                    
+                    match result {
+                        Ok(output) => {
+                            results.push(NodeExecutionResult {
+                                node_id: current_node.id.to_string(),
+                                node_name: current_node.label.clone(),
+                                success: true,
+                                output: Some(output.clone()),
+                                error: None,
+                                execution_time_ms: node_start_time.elapsed().as_millis() as u64,
+                            });
+                            
+                            // Find next nodes
+                            for edge in &all_edges {
+                                if edge.from == current_node.id {
+                                    if let Some(target_node) = all_nodes.iter().find(|n| n.id == edge.to) {
+                                        queue.push_back((target_node.clone(), output.clone()));
+                                    }
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            results.push(NodeExecutionResult {
+                                node_id: current_node.id.to_string(),
+                                node_name: current_node.label.clone(),
+                                success: false,
+                                output: None,
+                                error: Some(e),
+                                execution_time_ms: node_start_time.elapsed().as_millis() as u64,
+                            });
+                            break;
+                        }
+                    }
+                }
+
+                let _ = sqlx::query("UPDATE executions SET status = $1, results = $2, finished_at = NOW() WHERE id = $3")
+                    .bind("completed")
+                    .bind(serde_json::to_value(&results).unwrap_or_default())
+                    .bind(execution_id)
+                    .execute(&db)
+                    .await;
+            });
+        }
+    }
+
+    StatusCode::OK.into_response()
+}
 
 pub async fn handle_slack_interactive(
     State(state): State<AppState>,
     Form(payload): Form<serde_json::Value>,
 ) -> Result<StatusCode, StatusCode> {
-    // Slack sends payload as a string in a form field
     let payload_str = payload.get("payload").and_then(|v| v.as_str()).ok_or(StatusCode::BAD_REQUEST)?;
     let payload_json: serde_json::Value = serde_json::from_str(payload_str).map_err(|_| StatusCode::BAD_REQUEST)?;
     
     let ts = payload_json.get("container").and_then(|v| v.get("message_ts")).and_then(|v| v.as_str());
-    let channel = payload_json.get("channel").and_then(|v| v.get("id")).and_then(|v| v.as_str());
     let action_id = payload_json.get("actions").and_then(|v| v.get(0)).and_then(|v| v.get("action_id")).and_then(|v| v.as_str());
 
-    if let (Some(ts), Some(_ch), Some(action)) = (ts, channel, action_id) {
-        // Find the execution waiting for this message
-        // In a real implementation, we'd search by TS and Channel in the snapshot data
+    if let (Some(ts), Some(action)) = (ts, action_id) {
         let execution = sqlx::query_as::<_, ExecutionRecord>(
             "SELECT * FROM executions WHERE status = 'waiting' AND snapshot->'wait_info'->>'ts' = $1 LIMIT 1"
         )
@@ -30,57 +153,82 @@ pub async fn handle_slack_interactive(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         if let Some(record) = execution {
-            // Resume Execution
             let snapshot = record.snapshot.ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-            let mut last_output = serde_json::json!({
+            let last_output = serde_json::json!({
                 "action": action,
                 "user": payload_json.get("user").and_then(|v| v.get("username")).and_then(|v| v.as_str()),
-                "timestamp": chrono::Utc::now()
+                "timestamp": chrono::Utc::now().to_rfc3339()
             });
             
-            let remaining_nodes: Vec<Node> = serde_json::from_value(snapshot.get("remaining_nodes").cloned().unwrap_or_default()).unwrap_or_default();
+            let workflow = sqlx::query_as::<_, Workflow>("SELECT * FROM workflows WHERE id = $1")
+                .bind(Uuid::parse_str(&record.workflow_id).unwrap_or_default())
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .ok_or(StatusCode::NOT_FOUND)?;
+
+            let nodes_list: Vec<Node> = serde_json::from_value(workflow.nodes).unwrap_or_default();
+            let edges_list: Vec<Edge> = serde_json::from_value(workflow.edges).unwrap_or_default();
             let mut results: Vec<NodeExecutionResult> = serde_json::from_value(record.results).unwrap_or_default();
-            
-            // Continue execution loop
-            let mut success = true;
-            for node in remaining_nodes {
-                let node_start_time = std::time::Instant::now();
-                match execute_single_node(&state.db, &node, &vec![], &vec![], &last_output).await {
-                    Ok(output) => {
-                        last_output = output.clone();
-                        results.push(NodeExecutionResult {
-                            node_id: node.id.to_string(),
-                            node_name: node.label.clone(),
-                            success: true,
-                            output: Some(output),
-                            error: None,
-                            execution_time_ms: node_start_time.elapsed().as_millis() as u64,
-                        });
-                    }
-                    Err(e) => {
-                        success = false;
-                        results.push(NodeExecutionResult {
-                            node_id: node.id.to_string(),
-                            node_name: node.label.clone(),
-                            success: false,
-                            output: None,
-                            error: Some(e),
-                            execution_time_ms: node_start_time.elapsed().as_millis() as u64,
-                        });
-                        break;
+            let current_node_id = snapshot.get("current_node_id").and_then(|v| v.as_str()).unwrap_or("");
+
+            let mut execution_queue = std::collections::VecDeque::new();
+            for edge in &edges_list {
+                if edge.from.to_string() == current_node_id {
+                    if let Some(next_node) = nodes_list.iter().find(|n| n.id == edge.to) {
+                        execution_queue.push_back((next_node.clone(), last_output.clone()));
                     }
                 }
             }
 
-            // Update execution record to finished
-            let _ = sqlx::query(
-                "UPDATE executions SET status = $1, results = $2, end_time = NOW(), snapshot = NULL WHERE id = $3"
-            )
-            .bind(if success { "success" } else { "failed" })
-            .bind(serde_json::to_value(&results).unwrap_or_default())
-            .bind(record.id)
-            .execute(&state.db)
-            .await;
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                let mut success = true;
+                while let Some((node, input_data)) = execution_queue.pop_front() {
+                    let node_start_time = std::time::Instant::now();
+                    match execute_single_node(&db, &node, &nodes_list, &edges_list, &input_data).await {
+                        Ok(output) => {
+                            results.push(NodeExecutionResult {
+                                node_id: node.id.to_string(),
+                                node_name: node.label.clone(),
+                                success: true,
+                                output: Some(output.clone()),
+                                error: None,
+                                execution_time_ms: node_start_time.elapsed().as_millis() as u64,
+                            });
+
+                            for edge in &edges_list {
+                                if edge.from == node.id {
+                                    if let Some(next_node) = nodes_list.iter().find(|n| n.id == edge.to) {
+                                        execution_queue.push_back((next_node.clone(), output.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            success = false;
+                            results.push(NodeExecutionResult {
+                                node_id: node.id.to_string(),
+                                node_name: node.label.clone(),
+                                success: false,
+                                output: None,
+                                error: Some(e),
+                                execution_time_ms: node_start_time.elapsed().as_millis() as u64,
+                            });
+                            break;
+                        }
+                    }
+                }
+
+                let _ = sqlx::query(
+                    "UPDATE executions SET status = $1, results = $2, finished_at = NOW(), snapshot = NULL WHERE id = $3"
+                )
+                .bind(if success { "success" } else { "failed" })
+                .bind(serde_json::to_value(&results).unwrap_or_default())
+                .bind(record.id)
+                .execute(&db)
+                .await;
+            });
 
             return Ok(StatusCode::OK);
         }
@@ -88,13 +236,6 @@ pub async fn handle_slack_interactive(
 
     Ok(StatusCode::OK)
 }
-use uuid::Uuid;
-use crate::state::AppState;
-use crate::models::*;
-use crate::engine::execute_single_node;
-use crate::clients::openai::OpenAiMessage;
-use crate::clients::openrouter::{OpenRouterMessage, OpenRouterRequest};
-use serde::{Deserialize, Serialize};
 
 pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
@@ -670,3 +811,94 @@ pub struct ExecuteWorkflowRequest {
 pub struct HttpRequestExecuteRequest { pub url: String, pub method: String, pub headers: Option<Vec<(String, String)>>, pub body: Option<String> }
 #[derive(Debug, Serialize)]
 pub struct HttpRequestExecuteResponse { pub success: bool, pub status_code: Option<u16>, pub headers: Option<Vec<(String, String)>>, pub body: Option<String>, pub error: Option<String> }
+
+// Data Table Handlers
+pub async fn list_data_tables(State(state): State<AppState>) -> Json<Vec<DataTable>> {
+    let tables = sqlx::query_as::<_, DataTable>("SELECT * FROM data_tables ORDER BY name ASC")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    Json(tables)
+}
+
+pub async fn create_data_table(
+    State(state): State<AppState>,
+    Json(input): Json<DataTableInput>,
+) -> Result<Json<DataTable>, StatusCode> {
+    let table = DataTable {
+        id: Uuid::new_v4(),
+        name: input.name,
+        description: input.description,
+        schema: input.schema,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    sqlx::query("INSERT INTO data_tables (id, name, description, schema, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)")
+        .bind(table.id).bind(&table.name).bind(&table.description).bind(&table.schema).bind(table.created_at).bind(table.updated_at)
+        .execute(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(table))
+}
+
+pub async fn delete_data_table(Path(id): Path<Uuid>, State(state): State<AppState>) -> StatusCode {
+    let _ = sqlx::query("DELETE FROM data_tables WHERE id = $1").bind(id).execute(&state.db).await;
+    StatusCode::OK
+}
+
+pub async fn get_data_table_rows(Path(id): Path<Uuid>, State(state): State<AppState>) -> Json<Vec<DataTableRow>> {
+    let rows = sqlx::query_as::<_, DataTableRow>("SELECT * FROM data_table_rows WHERE table_id = $1 ORDER BY created_at DESC")
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    Json(rows)
+}
+
+pub async fn add_data_table_row(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    Json(data): Json<serde_json::Value>,
+) -> Result<Json<DataTableRow>, StatusCode> {
+    let row = DataTableRow {
+        id: Uuid::new_v4(),
+        table_id: id,
+        data,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    sqlx::query("INSERT INTO data_table_rows (id, table_id, data, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)")
+        .bind(row.id).bind(row.table_id).bind(&row.data).bind(row.created_at).bind(row.updated_at)
+        .execute(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(row))
+}
+
+pub async fn update_data_table_row(
+    Path((table_id, row_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Json(data): Json<serde_json::Value>,
+) -> Result<StatusCode, StatusCode> {
+    sqlx::query("UPDATE data_table_rows SET data = $1, updated_at = NOW() WHERE id = $2 AND table_id = $3")
+        .bind(data).bind(row_id).bind(table_id)
+        .execute(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+pub async fn delete_data_table_row(
+    Path((table_id, row_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+) -> StatusCode {
+    let _ = sqlx::query("DELETE FROM data_table_rows WHERE id = $1 AND table_id = $2")
+        .bind(row_id).bind(table_id)
+        .execute(&state.db).await;
+    StatusCode::OK
+}
+
+pub async fn update_data_table_schema(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    Json(schema): Json<serde_json::Value>,
+) -> Result<Json<DataTable>, StatusCode> {
+    let table = sqlx::query_as::<_, DataTable>("UPDATE data_tables SET schema = $1, updated_at = NOW() WHERE id = $2 RETURNING *")
+        .bind(schema).bind(id)
+        .fetch_one(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(table))
+}
