@@ -5,6 +5,22 @@ export function cn(...inputs: ClassValue[]) {
 	return twMerge(clsx(inputs));
 }
 
+export function downloadFile(data: string, fileName: string, format: string) {
+	let mimeType = 'text/plain';
+	if (format === 'csv') mimeType = 'text/csv';
+	if (format === 'json') mimeType = 'application/json';
+	
+	const blob = new Blob([data], { type: mimeType });
+	const url = window.URL.createObjectURL(blob);
+	const a = document.createElement('a');
+	a.href = url;
+	a.download = fileName || `download.${format === 'toBinary' ? 'bin' : format}`;
+	document.body.appendChild(a);
+	a.click();
+	window.URL.revokeObjectURL(url);
+	document.body.removeChild(a);
+}
+
 export type WithElementRef<T> = T & {
 	ref?: HTMLElement | null;
 };
