@@ -3,7 +3,6 @@
 	import type { Node } from '@xyflow/svelte';
 	import { Label } from '$lib/components/ui/label';
 	import { Input } from '$lib/components/ui/input';
-	import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "$lib/components/ui/select";
 
 	let { node } = $props<{ node: Node }>();
 	
@@ -41,7 +40,7 @@
 
 	<div class="grid gap-2">
 		<Label for="value">Date Value</Label>
-		<Input id="value" type="text" value={config.value ?? ''} oninput={(e: Event & { currentTarget: HTMLInputElement }) => update('value', e.currentTarget.value)} placeholder="{{ $input.date }} or ISO string" />
+		<Input id="value" type="text" value={config.value ?? ''} oninput={(e: Event & { currentTarget: HTMLInputElement }) => update('value', e.currentTarget.value)} placeholder={"{{ $input.date }} or ISO string"} />
 	</div>
 
 	{#if action === 'format'}
