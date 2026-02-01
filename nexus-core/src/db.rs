@@ -78,5 +78,34 @@ pub async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     // Migration for existing table
     let _ = sqlx::query("ALTER TABLE executions ADD COLUMN IF NOT EXISTS snapshot JSONB").execute(pool).await;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS data_tables (
+            id UUID PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT,
+            schema JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS data_table_rows (
+            id UUID PRIMARY KEY,
+            table_id UUID NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
+            data JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
