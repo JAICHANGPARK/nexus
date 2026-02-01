@@ -9,6 +9,7 @@ export type NodeKind =
 	| 'if'
 	| 'switch'
 	| 'merge'
+	| 'postgres'
 	// Transform
 	| 'code'
 	| 'http-request'
@@ -17,6 +18,9 @@ export type NodeKind =
 	| 'wait'
 	| 'rss-feed-read'
 	| 'slack'
+	| 'convert-to-file'
+	| 'extract-from-file'
+	| 'read-write-file'
 	// AI / LLM
 	| 'ai-agent'
 	| 'llm'
@@ -155,6 +159,17 @@ export const logicNodes: NodeDefinition[] = [
 			{ id: 'in2', label: '' }
 		],
 		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'postgres',
+		label: 'Postgres',
+		detail: 'Get, add and update data in Postgres',
+		tone: 'cobalt',
+		icon: 'PG',
+		width: 200,
+		minHeight: 100,
+		inputs: [{ id: 'in', label: '' }],
+		outputs: [{ id: 'out', label: '' }]
 	}
 ];
 
@@ -163,10 +178,21 @@ export const transformNodes: NodeDefinition[] = [
 	{
 		kind: 'code',
 		label: 'Code',
-		detail: 'Run JavaScript logic',
-		tone: 'cobalt',
+		detail: 'Custom JS/Python logic',
+		tone: 'amber',
 		icon: 'JS',
-		width: 220,
+		width: 200,
+		minHeight: 100,
+		inputs: [{ id: 'in', label: '' }],
+		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'dateTime',
+		label: 'Date & Time',
+		detail: 'Manipulate date and time values',
+		tone: 'purple',
+		icon: 'DT',
+		width: 200,
 		minHeight: 80,
 		inputs: [{ id: 'in', label: '' }],
 		outputs: [{ id: 'out', label: '' }]
@@ -235,6 +261,43 @@ export const transformNodes: NodeDefinition[] = [
 		detail: 'Send Slack message',
 		tone: 'cobalt',
 		icon: 'SL',
+		width: 200,
+		minHeight: 80,
+		inputs: [{ id: 'in', label: '' }],
+		outputs: [{ id: 'out', label: '' }]
+	}
+];
+
+// ========== FILE NODES ==========
+export const fileNodes: NodeDefinition[] = [
+	{
+		kind: 'convert-to-file',
+		label: 'Convert to File',
+		detail: 'JSON to binary (CSV, JSON, etc)',
+		tone: 'cobalt',
+		icon: 'CF',
+		width: 200,
+		minHeight: 80,
+		inputs: [{ id: 'in', label: '' }],
+		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'extract-from-file',
+		label: 'Extract from File',
+		detail: 'Binary to JSON',
+		tone: 'cobalt',
+		icon: 'EF',
+		width: 200,
+		minHeight: 80,
+		inputs: [{ id: 'in', label: '' }],
+		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'read-write-file',
+		label: 'Read/Write File',
+		detail: 'Local disk interaction',
+		tone: 'emerald',
+		icon: 'RW',
 		width: 200,
 		minHeight: 80,
 		inputs: [{ id: 'in', label: '' }],
@@ -348,6 +411,7 @@ export const nodeLibrary: NodeDefinition[] = [
 	...triggerNodes,
 	...logicNodes,
 	...transformNodes,
+	...fileNodes,
 	...aiNodes,
 	...toolNodes,
 	...endNode
