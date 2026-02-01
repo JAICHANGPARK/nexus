@@ -5,6 +5,7 @@ export type NodeKind =
 	| 'trigger-schedule'
 	| 'trigger-webhook'
 	| 'chat-trigger'
+	| 'slack-trigger'
 	// Logic/Flow Control
 	| 'if'
 	| 'switch'
@@ -18,6 +19,7 @@ export type NodeKind =
 	| 'wait'
 	| 'rss-feed-read'
 	| 'slack'
+	| 'data-table'
 	| 'convert-to-file'
 	| 'extract-from-file'
 	| 'read-write-file'
@@ -108,6 +110,17 @@ export const triggerNodes: NodeDefinition[] = [
 		detail: 'Triggers when an RSS feed is updated',
 		tone: 'emerald',
 		icon: 'RS',
+		width: 220,
+		minHeight: 80,
+		inputs: [],
+		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'slack-trigger',
+		label: 'Slack Trigger',
+		detail: 'Triggers on Slack events',
+		tone: 'emerald',
+		icon: 'SL',
 		width: 220,
 		minHeight: 80,
 		inputs: [],
@@ -261,6 +274,17 @@ export const transformNodes: NodeDefinition[] = [
 		detail: 'Send Slack message',
 		tone: 'cobalt',
 		icon: 'SL',
+		width: 200,
+		minHeight: 80,
+		inputs: [{ id: 'in', label: '' }],
+		outputs: [{ id: 'out', label: '' }]
+	},
+	{
+		kind: 'data-table',
+		label: 'Data Table',
+		detail: 'Read or write to internal tables',
+		tone: 'cobalt',
+		icon: 'DT',
 		width: 200,
 		minHeight: 80,
 		inputs: [{ id: 'in', label: '' }],
