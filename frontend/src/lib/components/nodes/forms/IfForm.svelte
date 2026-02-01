@@ -74,7 +74,7 @@
 			<div class="p-3 rounded-lg border bg-muted/30 space-y-3 relative group">
 				<div class="grid gap-1.5">
 					<Label class="text-[10px] text-muted-foreground uppercase font-bold">Value 1</Label>
-					<Input value={cond.leftValue} oninput={(e: any) => updateCondition(i, 'leftValue', e.target.value)} placeholder="{{ $input.field }}" class="h-8 text-xs" />
+					<Input value={cond.leftValue} oninput={(e: any) => updateCondition(i, 'leftValue', e.target.value)} placeholder={"{{ $input.field }}"} class="h-8 text-xs" />
 				</div>
 
 				<div class="grid grid-cols-2 gap-2">
