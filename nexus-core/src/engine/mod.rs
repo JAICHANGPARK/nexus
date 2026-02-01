@@ -1,6 +1,6 @@
 pub mod executor;
 
-use crate::models::{Node, Edge, Credential, McpServer};
+use crate::models::{Node, Edge, Credential, McpServer, DataTableRow};
 use crate::clients::{OpenAiClient, OpenRouterClient};
 use crate::clients::openai::OpenAiMessage;
 use crate::clients::openrouter::{OpenRouterMessage, OpenRouterRequest};
@@ -11,21 +11,43 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 fn interpolate_value(value: &str, input: &serde_json::Value) -> String {
     let mut result = value.to_string();
-    if let Some(obj) = input.as_object() {
-        for (k, v) in obj {
-            let placeholder = format!("{{{{ $input.{} }}}}", k);
-            let replacement = match v {
-                serde_json::Value::String(s) => s.clone(),
-                _ => v.to_string(),
-            };
-            result = result.replace(&placeholder, &replacement);
+    
+    // regex-like matching for {{ $input.path.to.key }}
+    // We'll do a simple iterative approach for multiple placeholders
+    while let Some(start) = result.find("{{") {
+        if let Some(end) = result[start..].find("}}") {
+            let full_placeholder = &result[start..start + end + 2];
+            let inner = full_placeholder[2..full_placeholder.len() - 2].trim();
+            
+            if inner == "$input" {
+                let replacement = match input {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => input.to_string(),
+                };
+                result = result.replace(full_placeholder, &replacement);
+            } else if inner.starts_with("$input.") {
+                let path = &inner[7..];
+                let mut current = input;
+                for part in path.split('.') {
+                    current = &current[part];
+                }
+                
+                let replacement = match current {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => "".to_string(),
+                    _ => current.to_string(),
+                };
+                result = result.replace(full_placeholder, &replacement);
+            } else {
+                // Not a recognized placeholder, skip it to avoid infinite loop
+                // We'll temporarily replace it with something unique and restore later or just break
+                break; 
+            }
+        } else {
+            break;
         }
     }
-    if input.is_string() {
-        result = result.replace("{{ $input }}", input.as_str().unwrap());
-    } else {
-        result = result.replace("{{ $input }}", &input.to_string());
-    }
+    
     result
 }
 
@@ -421,7 +443,7 @@ pub async fn execute_single_node(
         },
         "convert-to-file" => {
             let operation = node.config.get("operation").and_then(|v| v.as_str()).unwrap_or("csv");
-            let _binary_property = node.config.get("binaryPropertyName").and_then(|v| v.as_str()).unwrap_or("data");
+            let file_name = node.config.get("fileName").and_then(|v| v.as_str()).map(|s| interpolate_value(s, input));
             
             match operation {
                 "csv" => {
@@ -436,21 +458,21 @@ pub async fn execute_single_node(
                         wtr.serialize(obj).map_err(|e| e.to_string())?;
                     }
                     let data = String::from_utf8(wtr.into_inner().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                    Ok(serde_json::json!({ "data": data, "format": "csv" }))
+                    Ok(serde_json::json!({ "data": data, "format": "csv", "fileName": file_name.unwrap_or_else(|| "file.csv".to_string()) }))
                 },
                 "toJson" => {
                     let data = serde_json::to_string_pretty(input).map_err(|e| e.to_string())?;
-                    Ok(serde_json::json!({ "data": data, "format": "json" }))
+                    Ok(serde_json::json!({ "data": data, "format": "json", "fileName": file_name.unwrap_or_else(|| "file.json".to_string()) }))
                 },
                 "toText" => {
                     let source = node.config.get("sourceProperty").and_then(|v| v.as_str()).unwrap_or("data");
                     let data = input.get(source).and_then(|v| v.as_str()).unwrap_or("");
-                    Ok(serde_json::json!({ "data": data, "format": "text" }))
+                    Ok(serde_json::json!({ "data": data, "format": "text", "fileName": file_name.unwrap_or_else(|| "file.txt".to_string()) }))
                 },
                 "toBinary" => {
                     let source = node.config.get("sourceProperty").and_then(|v| v.as_str()).unwrap_or("data");
                     let b64 = input.get(source).and_then(|v| v.as_str()).unwrap_or("");
-                    Ok(serde_json::json!({ "data": b64, "format": "base64" }))
+                    Ok(serde_json::json!({ "data": b64, "format": "base64", "fileName": file_name.unwrap_or_else(|| "file.bin".to_string()) }))
                 },
                 _ => Err(format!("Unsupported convert operation: {}", operation))
             }
@@ -520,6 +542,96 @@ pub async fn execute_single_node(
             }
         },
 
+        "data-table" => {
+            let table_id_raw = node.config.get("tableId").and_then(|v| v.as_str()).ok_or("Table ID not specified")?;
+            let table_id = Uuid::parse_str(table_id_raw).map_err(|e| e.to_string())?;
+            let operation = node.config.get("operation").and_then(|v| v.as_str()).unwrap_or("getAll");
+
+            match operation {
+                "getAll" => {
+                    let rows = sqlx::query_as::<_, DataTableRow>("SELECT * FROM data_table_rows WHERE table_id = $1 ORDER BY created_at DESC")
+                        .bind(table_id)
+                        .fetch_all(pool)
+                        .await
+                        .map_err(|e: sqlx::Error| e.to_string())?;
+                    
+                    let result: Vec<serde_json::Value> = rows.into_iter().map(|r: DataTableRow| {
+                        let mut val = r.data.clone();
+                        if let Some(obj) = val.as_object_mut() {
+                            obj.insert("id".to_string(), serde_json::json!(r.id));
+                        }
+                        val
+                    }).collect();
+                    Ok(serde_json::Value::Array(result))
+                },
+                "get" => {
+                    let row_id_raw = node.config.get("rowId").and_then(|v| v.as_str()).ok_or("Row ID not specified")?;
+                    let row_id = Uuid::parse_str(&interpolate_value(row_id_raw, input)).map_err(|e| e.to_string())?;
+                    
+                    let row = sqlx::query_as::<_, DataTableRow>("SELECT * FROM data_table_rows WHERE id = $1 AND table_id = $2")
+                        .bind(row_id)
+                        .bind(table_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|e: sqlx::Error| e.to_string())?
+                        .ok_or("Row not found")?;
+                    
+                    let mut val = row.data.clone();
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("id".to_string(), serde_json::json!(row.id));
+                    }
+                    Ok(val)
+                },
+                "create" => {
+                    let row_id = Uuid::new_v4();
+                    sqlx::query("INSERT INTO data_table_rows (id, table_id, data, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW())")
+                        .bind(row_id)
+                        .bind(table_id)
+                        .bind(input)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    
+                    let mut val = input.clone();
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("id".to_string(), serde_json::json!(row_id));
+                    }
+                    Ok(val)
+                },
+                "update" => {
+                    let row_id_raw = node.config.get("rowId").and_then(|v| v.as_str()).ok_or("Row ID not specified")?;
+                    let row_id = Uuid::parse_str(&interpolate_value(row_id_raw, input)).map_err(|e| e.to_string())?;
+                    
+                    sqlx::query("UPDATE data_table_rows SET data = $1, updated_at = NOW() WHERE id = $2 AND table_id = $3")
+                        .bind(input)
+                        .bind(row_id)
+                        .bind(table_id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    
+                    let mut val = input.clone();
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("id".to_string(), serde_json::json!(row_id));
+                    }
+                    Ok(val)
+                },
+                "delete" => {
+                    let row_id_raw = node.config.get("rowId").and_then(|v| v.as_str()).ok_or("Row ID not specified")?;
+                    let row_id = Uuid::parse_str(&interpolate_value(row_id_raw, input)).map_err(|e| e.to_string())?;
+                    
+                    sqlx::query("DELETE FROM data_table_rows WHERE id = $1 AND table_id = $2")
+                        .bind(row_id)
+                        .bind(table_id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    
+                    Ok(serde_json::json!({ "deleted": true, "id": row_id }))
+                },
+                _ => Err(format!("Unsupported data-table operation: {}", operation))
+            }
+        },
         "trigger-start" | "trigger-schedule" | "trigger-webhook" => Ok(serde_json::json!({ "triggered": true })),
         "rss-feed-read" => {
             let url_raw = node.config.get("url").and_then(|v| v.as_str()).ok_or("URL not specified")?;
@@ -604,7 +716,6 @@ pub async fn execute_single_node(
                                         ]
                                     }
                                 ]));
-                                // Clear top-level text if using blocks for cleaner notification
                                 body.as_object_mut().unwrap().insert("text".to_string(), serde_json::json!(approve_text));
                             }
                         }
@@ -619,10 +730,8 @@ pub async fn execute_single_node(
                             .json(&body).send().await.map_err(|e| e.to_string())?;
                         
                         let res_json = response.json::<serde_json::Value>().await.map_err(|e| e.to_string())?;
-                        
                         if res_json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                             if operation == "sendAndWait" {
-                                // Return a special signal to pause execution
                                 return Ok(serde_json::json!({
                                     "__wait": true,
                                     "type": "slack_interactive",
@@ -631,80 +740,330 @@ pub async fn execute_single_node(
                                 }));
                             }
                             Ok(res_json)
-                        }
-                        else { Err(format!("Slack API Error: {}", res_json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error"))) }
+                        } else { Err(format!("Slack API Error: {}", res_json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error"))) }
                     },
                     "update" => {
-                        let channel_raw = node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?;
-                        let ts = node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?;
-                        let text_raw = node.config.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        
-                        let body = serde_json::json!({
-                            "channel": interpolate_value(channel_raw, input),
-                            "ts": interpolate_value(ts, input),
-                            "text": interpolate_value(text_raw, input),
-                        });
-                        
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?, input);
+                        let text = interpolate_value(node.config.get("text").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let body = serde_json::json!({ "channel": channel, "ts": ts, "text": text });
                         let response = client.post("https://slack.com/api/chat.update")
-                            .header("Authorization", format!("Bearer {}", api_key))
-                            .json(&body).send().await.map_err(|e| e.to_string())?;
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
                         Ok(response.json().await.map_err(|e| e.to_string())?)
                     },
                     "delete" => {
-                        let channel_raw = node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?;
-                        let ts = node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?;
-                        
-                        let body = serde_json::json!({
-                            "channel": interpolate_value(channel_raw, input),
-                            "ts": interpolate_value(ts, input),
-                        });
-                        
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel, "ts": ts });
                         let response = client.post("https://slack.com/api/chat.delete")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "getPermalink" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?, input);
+                        let response = client.get("https://slack.com/api/chat.getPermalink")
                             .header("Authorization", format!("Bearer {}", api_key))
-                            .json(&body).send().await.map_err(|e| e.to_string())?;
+                            .query(&[("channel", channel), ("message_ts", ts)]).send().await.map_err(|e| e.to_string())?;
                         Ok(response.json().await.map_err(|e| e.to_string())?)
                     },
                     "search" => {
-                        let query = node.config.get("query").and_then(|v| v.as_str()).ok_or("Query not specified")?;
+                        let query = interpolate_value(node.config.get("query").and_then(|v| v.as_str()).ok_or("Query not specified")?, input);
                         let response = client.get("https://slack.com/api/search.messages")
-                            .header("Authorization", format!("Bearer {}", api_key))
-                            .query(&[("query", interpolate_value(query, input))])
-                            .send().await.map_err(|e| e.to_string())?;
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("query", query)]).send().await.map_err(|e| e.to_string())?;
                         Ok(response.json().await.map_err(|e| e.to_string())?)
                     },
                     _ => Err(format!("Unsupported Slack operation: {}", operation))
                 },
                 "channel" => match operation {
                     "create" => {
-                        let name = node.config.get("name").and_then(|v| v.as_str()).ok_or("Channel name not specified")?;
+                        let name = interpolate_value(node.config.get("name").and_then(|v| v.as_str()).ok_or("Channel name not specified")?, input);
                         let is_private = node.config.get("isPrivate").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let body = serde_json::json!({ "name": interpolate_value(name, input), "is_private": is_private });
+                        let body = serde_json::json!({ "name": name, "is_private": is_private });
                         let response = client.post("https://slack.com/api/conversations.create")
-                            .header("Authorization", format!("Bearer {}", api_key))
-                            .json(&body).send().await.map_err(|e| e.to_string())?;
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "get" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let response = client.get("https://slack.com/api/conversations.info")
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("channel", channel)]).send().await.map_err(|e| e.to_string())?;
                         Ok(response.json().await.map_err(|e| e.to_string())?)
                     },
                     "getAll" => {
                         let response = client.get("https://slack.com/api/conversations.list")
+                            .header("Authorization", format!("Bearer {}", api_key)).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "history" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let response = client.get("https://slack.com/api/conversations.history")
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("channel", channel)]).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "invite" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let users = interpolate_value(node.config.get("userIds").and_then(|v| v.as_str()).ok_or("User IDs not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel, "users": users });
+                        let response = client.post("https://slack.com/api/conversations.invite")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "join" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel });
+                        let response = client.post("https://slack.com/api/conversations.join")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "kick" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let user = interpolate_value(node.config.get("userId").and_then(|v| v.as_str()).ok_or("User ID not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel, "user": user });
+                        let response = client.post("https://slack.com/api/conversations.kick")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "leave" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel });
+                        let response = client.post("https://slack.com/api/conversations.leave")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "member" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let response = client.get("https://slack.com/api/conversations.members")
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("channel", channel)]).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "rename" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let name = interpolate_value(node.config.get("name").and_then(|v| v.as_str()).ok_or("New name not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel, "name": name });
+                        let response = client.post("https://slack.com/api/conversations.rename")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "replies" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?, input);
+                        let response = client.get("https://slack.com/api/conversations.replies")
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("channel", channel), ("ts", ts)]).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "setPurpose" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let purpose = interpolate_value(node.config.get("purpose").and_then(|v| v.as_str()).ok_or("Purpose not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel, "purpose": purpose });
+                        let response = client.post("https://slack.com/api/conversations.setPurpose")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "setTopic" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let topic = interpolate_value(node.config.get("topic").and_then(|v| v.as_str()).ok_or("Topic not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel, "topic": topic });
+                        let response = client.post("https://slack.com/api/conversations.setTopic")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "archive" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel });
+                        let response = client.post("https://slack.com/api/conversations.archive")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "unarchive" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel });
+                        let response = client.post("https://slack.com/api/conversations.unarchive")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "close" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel });
+                        let response = client.post("https://slack.com/api/conversations.close")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    _ => Err(format!("Unsupported Slack operation: {}", operation))
+                },
+                "file" => match operation {
+                    "upload" => {
+                        let channels = interpolate_value(node.config.get("channels").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let content = interpolate_value(node.config.get("fileContent").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let title = interpolate_value(node.config.get("title").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let mut body = serde_json::json!({ "content": content });
+                        if !channels.is_empty() { body.as_object_mut().unwrap().insert("channels".to_string(), serde_json::json!(channels)); }
+                        if !title.is_empty() { body.as_object_mut().unwrap().insert("title".to_string(), serde_json::json!(title)); }
+                        let response = client.post("https://slack.com/api/files.upload")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "get" => {
+                        let file = interpolate_value(node.config.get("fileId").and_then(|v| v.as_str()).ok_or("File ID not specified")?, input);
+                        let response = client.get("https://slack.com/api/files.info")
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("file", file)]).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "getAll" => {
+                        let response = client.get("https://slack.com/api/files.list")
+                            .header("Authorization", format!("Bearer {}", api_key)).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    _ => Err(format!("Unsupported Slack operation: {}", operation))
+                },
+                "reaction" => match operation {
+                    "add" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?, input);
+                        let name = interpolate_value(node.config.get("name").and_then(|v| v.as_str()).ok_or("Reaction name not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel, "timestamp": ts, "name": name });
+                        let response = client.post("https://slack.com/api/reactions.add")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "get" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?, input);
+                        let response = client.get("https://slack.com/api/reactions.get")
                             .header("Authorization", format!("Bearer {}", api_key))
-                            .send().await.map_err(|e| e.to_string())?;
+                            .query(&[("channel", channel), ("timestamp", ts)]).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "remove" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).ok_or("Channel not specified")?, input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).ok_or("TS not specified")?, input);
+                        let name = interpolate_value(node.config.get("name").and_then(|v| v.as_str()).ok_or("Reaction name not specified")?, input);
+                        let body = serde_json::json!({ "channel": channel, "timestamp": ts, "name": name });
+                        let response = client.post("https://slack.com/api/reactions.remove")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    _ => Err(format!("Unsupported Slack operation: {}", operation))
+                },
+                "star" => match operation {
+                    "add" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let file = interpolate_value(node.config.get("fileId").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let mut body = serde_json::json!({});
+                        if !channel.is_empty() { body.as_object_mut().unwrap().insert("channel".to_string(), serde_json::json!(channel)); }
+                        if !ts.is_empty() { body.as_object_mut().unwrap().insert("timestamp".to_string(), serde_json::json!(ts)); }
+                        if !file.is_empty() { body.as_object_mut().unwrap().insert("file".to_string(), serde_json::json!(file)); }
+                        let response = client.post("https://slack.com/api/stars.add")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "delete" => {
+                        let channel = interpolate_value(node.config.get("channelId").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let ts = interpolate_value(node.config.get("ts").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let file = interpolate_value(node.config.get("fileId").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let mut body = serde_json::json!({});
+                        if !channel.is_empty() { body.as_object_mut().unwrap().insert("channel".to_string(), serde_json::json!(channel)); }
+                        if !ts.is_empty() { body.as_object_mut().unwrap().insert("timestamp".to_string(), serde_json::json!(ts)); }
+                        if !file.is_empty() { body.as_object_mut().unwrap().insert("file".to_string(), serde_json::json!(file)); }
+                        let response = client.post("https://slack.com/api/stars.remove")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "getAll" => {
+                        let response = client.get("https://slack.com/api/stars.list")
+                            .header("Authorization", format!("Bearer {}", api_key)).send().await.map_err(|e| e.to_string())?;
                         Ok(response.json().await.map_err(|e| e.to_string())?)
                     },
                     _ => Err(format!("Unsupported Slack operation: {}", operation))
                 },
                 "user" => match operation {
                     "info" => {
-                        let user = node.config.get("user").and_then(|v| v.as_str()).ok_or("User ID not specified")?;
+                        let user = interpolate_value(node.config.get("user").and_then(|v| v.as_str()).ok_or("User ID not specified")?, input);
                         let response = client.get("https://slack.com/api/users.info")
-                            .header("Authorization", format!("Bearer {}", api_key))
-                            .query(&[("user", interpolate_value(user, input))])
-                            .send().await.map_err(|e| e.to_string())?;
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("user", user)]).send().await.map_err(|e| e.to_string())?;
                         Ok(response.json().await.map_err(|e| e.to_string())?)
                     },
                     "getAll" => {
                         let response = client.get("https://slack.com/api/users.list")
-                            .header("Authorization", format!("Bearer {}", api_key))
-                            .send().await.map_err(|e| e.to_string())?;
+                            .header("Authorization", format!("Bearer {}", api_key)).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    _ => Err(format!("Unsupported Slack operation: {}", operation))
+                },
+                "userGroup" => match operation {
+                    "create" => {
+                        let name = interpolate_value(node.config.get("name").and_then(|v| v.as_str()).ok_or("Name not specified")?, input);
+                        let handle = interpolate_value(node.config.get("handle").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let description = interpolate_value(node.config.get("description").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let mut body = serde_json::json!({ "name": name });
+                        if !handle.is_empty() { body.as_object_mut().unwrap().insert("handle".to_string(), serde_json::json!(handle)); }
+                        if !description.is_empty() { body.as_object_mut().unwrap().insert("description".to_string(), serde_json::json!(description)); }
+                        let response = client.post("https://slack.com/api/usergroups.create")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "update" => {
+                        let id = interpolate_value(node.config.get("userGroupId").and_then(|v| v.as_str()).ok_or("User Group ID not specified")?, input);
+                        let name = interpolate_value(node.config.get("name").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let mut body = serde_json::json!({ "usergroup": id });
+                        if !name.is_empty() { body.as_object_mut().unwrap().insert("name".to_string(), serde_json::json!(name)); }
+                        let response = client.post("https://slack.com/api/usergroups.update")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "getAll" => {
+                        let response = client.get("https://slack.com/api/usergroups.list")
+                            .header("Authorization", format!("Bearer {}", api_key)).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "enable" => {
+                        let id = interpolate_value(node.config.get("userGroupId").and_then(|v| v.as_str()).ok_or("User Group ID not specified")?, input);
+                        let body = serde_json::json!({ "usergroup": id });
+                        let response = client.post("https://slack.com/api/usergroups.enable")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "disable" => {
+                        let id = interpolate_value(node.config.get("userGroupId").and_then(|v| v.as_str()).ok_or("User Group ID not specified")?, input);
+                        let body = serde_json::json!({ "usergroup": id });
+                        let response = client.post("https://slack.com/api/usergroups.disable")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "getUsers" => {
+                        let id = interpolate_value(node.config.get("userGroupId").and_then(|v| v.as_str()).ok_or("User Group ID not specified")?, input);
+                        let response = client.get("https://slack.com/api/usergroups.users.list")
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("usergroup", id)]).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "updateUsers" => {
+                        let id = interpolate_value(node.config.get("userGroupId").and_then(|v| v.as_str()).ok_or("User Group ID not specified")?, input);
+                        let users = interpolate_value(node.config.get("users").and_then(|v| v.as_str()).ok_or("Users not specified")?, input);
+                        let body = serde_json::json!({ "usergroup": id, "users": users });
+                        let response = client.post("https://slack.com/api/usergroups.users.update")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    _ => Err(format!("Unsupported Slack operation: {}", operation))
+                },
+                "userProfile" => match operation {
+                    "get" => {
+                        let user = interpolate_value(node.config.get("user").and_then(|v| v.as_str()).ok_or("User ID not specified")?, input);
+                        let response = client.post("https://slack.com/api/users.profile.get")
+                            .header("Authorization", format!("Bearer {}", api_key)).query(&[("user", user)]).send().await.map_err(|e| e.to_string())?;
+                        Ok(response.json().await.map_err(|e| e.to_string())?)
+                    },
+                    "update" => {
+                        let user = interpolate_value(node.config.get("user").and_then(|v| v.as_str()).ok_or("User ID not specified")?, input);
+                        let first_name = interpolate_value(node.config.get("firstName").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let last_name = interpolate_value(node.config.get("lastName").and_then(|v| v.as_str()).unwrap_or(""), input);
+                        let mut profile = serde_json::json!({});
+                        if !first_name.is_empty() { profile.as_object_mut().unwrap().insert("first_name".to_string(), serde_json::json!(first_name)); }
+                        if !last_name.is_empty() { profile.as_object_mut().unwrap().insert("last_name".to_string(), serde_json::json!(last_name)); }
+                        let body = serde_json::json!({ "user": user, "profile": profile });
+                        let response = client.post("https://slack.com/api/users.profile.set")
+                            .header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await.map_err(|e| e.to_string())?;
                         Ok(response.json().await.map_err(|e| e.to_string())?)
                     },
                     _ => Err(format!("Unsupported Slack operation: {}", operation))
@@ -792,7 +1151,13 @@ pub async fn execute_single_node(
                 _ => Err(format!("Unsupported action: {}", action))
             }
         }
-        "chat-trigger" => Ok(node.config.get("initialInput").cloned().unwrap_or(serde_json::json!({ "triggered": true }))),
+        "chat-trigger" => {
+            if let Some(val) = node.config.get("initialInput") {
+                Ok(val.clone())
+            } else {
+                Ok(serde_json::json!({ "triggered": true }))
+            }
+        },
         _ => Ok(serde_json::json!({ "result": "Node executed" })),
     }
 }
